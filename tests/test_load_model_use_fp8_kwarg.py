@@ -132,6 +132,73 @@ def test_groot_n17_sm89_is_not_registered_without_validation():
         resolve_pipeline_class("groot_n17", "torch", "rtx_sm89")
 
 
+def test_wan22_ti2v_5b_rtx_sm120_is_registered():
+    from flash_rt.hardware import resolve_pipeline_class
+
+    cls = resolve_pipeline_class("wan22_ti2v_5b", "torch", "rtx_sm120")
+    assert cls.__name__ == "Wan22TorchFrontendRtx"
+
+
+def test_wan22_ti2v_5b_sm89_is_not_registered_without_validation():
+    from flash_rt.hardware import resolve_pipeline_class
+
+    with pytest.raises(RuntimeError, match="rtx_sm120"):
+        resolve_pipeline_class("wan22_ti2v_5b", "torch", "rtx_sm89")
+
+
+def test_load_model_accepts_wan22_ti2v_5b_config():
+    from flash_rt.api import load_model
+
+    class Wan22Frontend:
+        seen = None
+
+        def __init__(self, checkpoint, num_views=1, autotune=3):
+            type(self).seen = {
+                "checkpoint": checkpoint,
+                "num_views": num_views,
+                "autotune": autotune,
+            }
+
+        def set_prompt(self, *args, **kwargs):
+            return None
+
+        def infer(self, *args, **kwargs):
+            return None
+
+    with patch("flash_rt.hardware.resolve_pipeline_class",
+              return_value=Wan22Frontend):
+        model = load_model(
+            "unused-checkpoint",
+            config="wan22_ti2v_5b",
+            framework="torch",
+            hardware="rtx_sm120",
+            num_views=1,
+            autotune=0,
+        )
+
+    assert isinstance(model._pipe, Wan22Frontend)
+    assert Wan22Frontend.seen == {
+        "checkpoint": "unused-checkpoint",
+        "num_views": 1,
+        "autotune": 0,
+    }
+
+
+def test_wan22_infer_exposes_teacache_parameters():
+    import inspect
+    from flash_rt.frontends.torch.wan22_rtx import Wan22TorchFrontendRtx
+
+    sig = inspect.signature(Wan22TorchFrontendRtx.infer)
+    for name in (
+        "teacache",
+        "teacache_threshold",
+        "teacache_start_step",
+        "teacache_end_step",
+        "teacache_cache_device",
+    ):
+        assert name in sig.parameters
+
+
 def test_load_model_accepts_groot_n17_config():
     from flash_rt.api import load_model
 
