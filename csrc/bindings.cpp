@@ -22,6 +22,9 @@
 #include "gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cuh"
 #include "gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cuh"
 #endif
+#ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
+#include "gemm/fp4/cutlass_nvfp4_w4a16_gemm_sm100.cuh"
+#endif
 #ifdef ENABLE_ACTION_FFN_MEGAKERNEL_V6T
 #include "kernels/megakernel/action_ffn_megakernel_v6t_sm120.cuh"
 #endif
@@ -35,7 +38,7 @@
 #ifdef ENABLE_QWEN36_FLASHINFER_XQA
 #include "kernels/qwen36_flashinfer_xqa.cuh"
 #endif
-#ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16
+#if defined(ENABLE_CUTLASS_SM120_NVFP4_W4A16) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
 #include "quantize/nvfp4_sf_reshape_sm120.cuh"
 #endif
 #ifdef ENABLE_FP8_CONV3D_V17
@@ -132,6 +135,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/qwen36_misc.cuh"
 #include "kernels/bf16_matvec_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
+#include "kernels/bf16_matmul_qwen36_thor.cuh"
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
 #include "kernels/fp4_w4a4_mma_sm120.cuh"
 #include "quantize/fp8_block128_dequant.cuh"
@@ -858,7 +862,14 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
                                   reinterpret_cast<float*>(d_scale), n, to_stream(stream));
     }, py::arg("input"), py::arg("output"), py::arg("d_scale"), py::arg("n"), py::arg("stream") = 0);
 
-#ifdef ENABLE_NVFP4
+// Bindings below cover the BF16->NVFP4 quantize / norm-fused-quantize
+// family. The kernels themselves live in csrc/kernels/quantize.cu and
+// are compiled into flash_rt_kernels unconditionally for every Blackwell
+// target (sm_110 Thor and sm_120 RTX). The original gate is sm_120-only
+// because the symbol family was introduced alongside the Motus NVFP4
+// path; Qwen3.6 on Thor reaches the same fused norm + quant kernels at
+// every pre-projection site, so the SM100 W4A16 build also opts in here.
+#if defined(ENABLE_NVFP4) || defined(ENABLE_CUTLASS_SM100_NVFP4_W4A16)
     m.def("quantize_bf16_to_nvfp4", [](uintptr_t input, uintptr_t fp4_data,
                                          uintptr_t scale_factors, int rows, int cols,
                                          uintptr_t stream) {
@@ -3984,6 +3995,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("x"), py::arg("W"), py::arg("out"),
         py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
 
+    // Thor-only MTP prompt-tail fc matmul. Returns 0 on success, a
+    // non-zero value if the device cannot support the kernel's
+    // shared-memory configuration; the caller must fall back to
+    // bf16_matmul_qwen36_bf16 in that case.
+    m.def("bf16_matmul_qwen36_thor_mtp_fc_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t out,
+           int M, int N, uintptr_t stream) -> int {
+            return flash_rt::kernels::bf16_matmul_qwen36_thor_mtp_fc_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                M, N, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("stream") = 0);
+
     m.def("bf16_matmul_qwen36_ab96_bf16",
         [](uintptr_t x, uintptr_t W_ab, uintptr_t out_ab,
            int M, uintptr_t stream) {
@@ -4202,6 +4229,27 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         py::arg("q"), py::arg("k"), py::arg("v"),
         py::arg("g"), py::arg("beta"),
         py::arg("state_in"), py::arg("state_out"), py::arg("out"),
+        py::arg("B"), py::arg("num_v_heads"),
+        py::arg("head_k_dim"), py::arg("head_v_dim"),
+        py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
+
+    // FP32-state variant (Thor K-row no-LSB-jitter path).
+    m.def("gated_deltanet_recurrent_qwen36_f32state_bf16io",
+        [](uintptr_t q, uintptr_t k, uintptr_t v,
+           uintptr_t g, uintptr_t beta,
+           uintptr_t state_f32, uintptr_t out,
+           int B, int num_v_heads, int head_k_dim, int head_v_dim,
+           bool use_qk_l2norm, uintptr_t stream) {
+            flash_rt::kernels::gated_deltanet_recurrent_qwen36_f32state_bf16io(
+                to_ptr(q), to_ptr(k), to_ptr(v),
+                to_ptr(g), to_ptr(beta),
+                to_ptr(state_f32), to_ptr(out),
+                B, num_v_heads, head_k_dim, head_v_dim,
+                use_qk_l2norm, to_stream(stream));
+        },
+        py::arg("q"), py::arg("k"), py::arg("v"),
+        py::arg("g"), py::arg("beta"),
+        py::arg("state_f32"), py::arg("out"),
         py::arg("B"), py::arg("num_v_heads"),
         py::arg("head_k_dim"), py::arg("head_v_dim"),
         py::arg("use_qk_l2norm") = true, py::arg("stream") = 0);
@@ -5631,6 +5679,97 @@ per-warp. Drop-in replacement signature for fp4_w4a4_matvec_sm120
 N must be a multiple of 32; K must be a multiple of 64.
 )pbdoc");
 
+#endif
+
+// ─────────────────────────────────────────────────────────────────────
+// SM100 NVFP4 W4A16 GEMM bindings (Thor SM110).
+//
+// Mutually exclusive with ENABLE_CUTLASS_SM120_NVFP4_W4A16; the CMake
+// gates ensure only one of the two object libraries is linked into
+// flash_rt_kernels for a given GPU_ARCH. The public Python names are
+// kept identical to the SM120 surface ("fp4_w4a16_gemm_sm120_bf16out*")
+// because that is the frozen ABI the Qwen3.6 frontend already calls;
+// the underlying implementation is dispatched by build arch.
+//
+// On Thor only the three core W4A16 entries are needed by the Qwen
+// frontend (default / widen / pingpong). The Motus-specific
+// bias_gelu / streamk fp4-out variants are SM120-exclusive and stay
+// out of the Thor surface.
+// ─────────────────────────────────────────────────────────────────────
+#ifdef ENABLE_CUTLASS_SM100_NVFP4_W4A16
+    m.def("fp4_w4a16_gemm_sm120_bf16out",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_sm100_bf16out(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                M, N, K,
+                to_ptr(SFA), to_ptr(SFB),
+                alpha,
+                to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    m.def("fp4_w4a16_gemm_sm120_bf16out_widen",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_sm100_bf16out_widen(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                M, N, K,
+                to_ptr(SFA), to_ptr(SFB),
+                alpha,
+                to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    m.def("fp4_w4a16_gemm_sm120_bf16out_pingpong",
+        [](uintptr_t A_packed, uintptr_t B_packed, uintptr_t D,
+           int M, int N, int K,
+           uintptr_t SFA, uintptr_t SFB,
+           float alpha,
+           uintptr_t stream) {
+            flash_rt::gemm::fp4_w4a16_gemm_sm100_bf16out_pingpong(
+                to_ptr(A_packed), to_ptr(B_packed), to_ptr(D),
+                M, N, K,
+                to_ptr(SFA), to_ptr(SFB),
+                alpha,
+                to_stream(stream));
+        },
+        py::arg("A_packed"), py::arg("B_packed"), py::arg("D"),
+        py::arg("M"), py::arg("N"), py::arg("K"),
+        py::arg("SFA"), py::arg("SFB"),
+        py::arg("alpha") = 1.0f,
+        py::arg("stream") = 0);
+
+    // SF reshape (memory permutation only, arch-agnostic). Same Python
+    // names as the SM120 surface so the weight loader works unchanged.
+    m.def("nvfp4_sf_linear_to_swizzled",
+        [](uintptr_t src_linear, uintptr_t dst_swz,
+           int rows, int D, bool is_sfb, uintptr_t stream) {
+            return flash_rt::fp4::nvfp4_sf_linear_to_swizzled(
+                to_ptr(src_linear), to_ptr(dst_swz),
+                rows, D, is_sfb, to_stream(stream));
+        },
+        py::arg("src_linear"), py::arg("dst_swz"),
+        py::arg("rows"), py::arg("D"),
+        py::arg("is_sfb") = false, py::arg("stream") = 0);
+
+    m.def("nvfp4_sf_swizzled_bytes",
+        &flash_rt::fp4::nvfp4_sf_swizzled_bytes,
+        py::arg("rows"), py::arg("D"));
 #endif
 
 #ifdef ENABLE_ACTION_FFN_MEGAKERNEL_V6T
