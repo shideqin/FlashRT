@@ -162,6 +162,11 @@ option(FLASHRT_BUILD_QWEN3_VL
 # OFF by default; enable with -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON.
 option(FLASHRT_ENABLE_MELBAND_ROFORMER
        "Build MelBandRoformer custom fused kernels (BF16/FP8, SM120)" OFF)
+# OmniVoice TTS — builds flash_rt_omnivoice.so (cfg_combine + maskgit_sample/select)
+# and gates csrc/kernels/cfg_combine.cu + maskgit_sample.cu out of flash_rt_kernels.
+# Enable explicitly on a Blackwell (sm_120) build.
+option(FLASHRT_ENABLE_OMNIVOICE
+       "Build OmniVoice TTS RTX SM120 fused kernels (cfg_combine, maskgit)" OFF)
 if(FLASHRT_ENABLE_MOTUS)
   message(STATUS "Motus beta kernels: ENABLED")
 else()
@@ -886,6 +891,39 @@ endif()
 # for this model. Caller side:
 #     from flash_rt import flash_rt_qwen3_vl_kernels as vlk
 #     vlk.rope_neox_qk_bf16(...)
+# ── OmniVoice fused kernels (standalone module, independent of flash_rt_kernels) ──
+if(FLASHRT_ENABLE_OMNIVOICE)
+  if(NOT GPU_ARCH STREQUAL "120")
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_OMNIVOICE requires GPU_ARCH=120 (Blackwell / sm_120); "
+      "got '${GPU_ARCH}'.")
+  endif()
+  pybind11_add_module(flash_rt_omnivoice
+    csrc/omnivoice_extra_bindings.cpp
+    csrc/kernels/cfg_combine.cu
+    csrc/kernels/maskgit_sample.cu
+    csrc/kernels/maskgit_select.cu)
+  set_target_properties(flash_rt_omnivoice PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_omnivoice PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_omnivoice PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_BFLOAT16_OPERATORS__
+      -U__CUDA_NO_BFLOAT162_OPERATORS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_omnivoice PRIVATE CUDA::cudart CUDA::curand)
+  install(TARGETS flash_rt_omnivoice LIBRARY DESTINATION flash_rt)
+  message(STATUS "OmniVoice TTS SM120 kernels: ENABLED")
+else()
+  message(STATUS "OmniVoice TTS SM120 kernels: DISABLED")
+endif()
+
 if(FLASHRT_BUILD_QWEN3_VL)
   # The Qwen3-VL path depends on the SM120 Qwen3 NVFP4 / FP8 block-128
   # kernels, so this module only builds for RTX 5090 (sm_120).
@@ -971,6 +1009,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/fusion.cu
   csrc/kernels/patch_embed.cu
   csrc/kernels/softmax.cu
+  csrc/kernels/fused_qk_norm_rope.cu
   csrc/kernels/attention_cublas.cu
   csrc/kernels/attention_mha.cu
   csrc/kernels/attention_mha_causal.cu
