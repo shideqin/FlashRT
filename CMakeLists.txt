@@ -133,8 +133,8 @@ endif()
 #                              pi0.5 / groot need bf16. Default "fp16;bf16".
 set(FA2_ARCH_NATIVE_ONLY OFF CACHE BOOL
     "Only build FA2 for the detected arch (no sm_80/PTX fallback). ~66% faster build.")
-set(FA2_HDIMS "96;128;256" CACHE STRING
-    "Semicolon-separated FA2 head_dim instantiations to build. Shipped models use 96 and 256.")
+set(FA2_HDIMS "64;96;128;256" CACHE STRING
+    "Semicolon-separated FA2 head_dim instantiations to build. Qwen3-VL 2B vision uses 64; other shipped models use 96 and 256.")
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
 
@@ -709,8 +709,8 @@ if(ENABLE_FA2)
   set(FA2_BUILT_HDIMS "")
   set(FA2_BUILT_DTYPES "")
   foreach(_hd IN LISTS FA2_HDIMS)
-    if(NOT _hd MATCHES "^(96|128|256)$")
-      message(FATAL_ERROR "FA2_HDIMS entry '${_hd}' not supported. Valid: 96, 128, 256.")
+    if(NOT _hd MATCHES "^(64|96|128|256)$")
+      message(FATAL_ERROR "FA2_HDIMS entry '${_hd}' not supported. Valid: 64, 96, 128, 256.")
     endif()
     list(APPEND FA2_BUILT_HDIMS ${_hd})
     foreach(_dt IN LISTS FA2_DTYPES)
@@ -719,8 +719,15 @@ if(ENABLE_FA2)
       endif()
       list(APPEND FA2_SRCS
         ${FA2_SRC_ROOT}/flash_fwd_hdim${_hd}_${_dt}_sm80.cu
-        ${FA2_SRC_ROOT}/flash_fwd_split_hdim${_hd}_${_dt}_sm80.cu
       )
+      # hdim64 (Qwen3-VL 2B vision full attention) always takes the no-split
+      # path, so skip its split-KV specialization -- that variant is unused
+      # and one of the most expensive objects for ptxas.
+      if(NOT _hd STREQUAL "64")
+        list(APPEND FA2_SRCS
+          ${FA2_SRC_ROOT}/flash_fwd_split_hdim${_hd}_${_dt}_sm80.cu
+        )
+      endif()
     endforeach()
   endforeach()
   foreach(_dt IN LISTS FA2_DTYPES)
@@ -924,18 +931,36 @@ else()
 endif()
 
 if(FLASHRT_BUILD_QWEN3_VL)
-  # The Qwen3-VL path depends on the SM120 Qwen3 NVFP4 / FP8 block-128
-  # kernels, so this module only builds for RTX 5090 (sm_120).
-  if(NOT GPU_ARCH STREQUAL "120")
+  # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
+  # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official
+  # FP8 Qwen3-VL path. Both build into the same separate module so neither
+  # bloats the central flash_rt_kernels.so.
+  if(NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89"))
     message(FATAL_ERROR
-      "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120); "
-      "got '${GPU_ARCH}'.")
+      "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120) or "
+      "GPU_ARCH=89 (Ada / sm_89); got '${GPU_ARCH}'.")
   endif()
-  pybind11_add_module(flash_rt_qwen3_vl_kernels
+  set(QWEN3_VL_SOURCES
     csrc/qwen3_vl_bindings.cpp
     csrc/kernels/rope_neox_qk_bf16.cu
     csrc/kernels/norm_act_to_fp8_block128.cu
     csrc/kernels/bias_epilogue_bf16.cu)
+  if(GPU_ARCH STREQUAL "89")
+    # Ada has no TMA / no warp-specialized CUTLASS collective, so these are
+    # hand-written cp.async + ldmatrix + block-128 scaling kernels (see
+    # docs/qwen3_vl_fp8_sm89.md for why the SM120a CUTLASS path does not port).
+    list(APPEND QWEN3_VL_SOURCES
+      csrc/gemm/fp8_block128_gemm_mma_sm89.cu
+      csrc/gemm/fp8_gemv_m1_sm89.cu
+      csrc/quantize/fp8_per_token_block_quant.cu
+      csrc/kernels/qwen3_qkv_post_proc.cu
+      csrc/kernels/bf16_matmul_qwen36.cu)
+  endif()
+  pybind11_add_module(flash_rt_qwen3_vl_kernels ${QWEN3_VL_SOURCES})
+  if(GPU_ARCH STREQUAL "89")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_SM89_BLOCK_FP8_GEMM=1)
+  endif()
   set_target_properties(flash_rt_qwen3_vl_kernels PROPERTIES
     CUDA_STANDARD 17
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
@@ -951,6 +976,10 @@ if(FLASHRT_BUILD_QWEN3_VL)
       ${GPU_GENCODE}
     >)
   target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
+  if(GPU_ARCH STREQUAL "89")
+    # bf16_matmul_qwen36 (ViT bf16 linears on SM89) uses cuBLASLt.
+    target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cublasLt)
+  endif()
   install(TARGETS flash_rt_qwen3_vl_kernels
     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
   message(STATUS "Qwen3-VL pybind module: flash_rt_qwen3_vl_kernels (separate .so)")
