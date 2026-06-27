@@ -14,11 +14,6 @@ warnings.filterwarnings("ignore")
 # Add FlashRT repo root to path (repo convention: tests/ run from root)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 
-# Optionally add an external bundle dir for flashcli-deployed testing
-_bundle = os.environ.get("OMNIVOICE_BUNDLE", "").strip()
-if _bundle:
-    sys.path.insert(0, _bundle)
-
 
 class TestDefaultBuild:
     """Default build (FLASHRT_ENABLE_OMNIVOICE=OFF).
