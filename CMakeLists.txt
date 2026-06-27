@@ -168,6 +168,24 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# ── Slim build for VLA deployments ──
+# OFF by default: the standard build keeps the broad, compatibility-oriented
+# kernel set it has today. Turn ON (-DFLASHRT_SLIM_BUILD=ON) to drop
+# model/architecture-specific translation units that a given hardware/model
+# path does not need, reducing flash_rt_kernels compile time on weaker
+# deployment machines. This is COMPILE-TIME surface reduction only; it never
+# changes kernel math, dispatch, graph capture, or runtime fallback. Each gated
+# group is guarded by its own internal FLASHRT_HAVE_* compile-def so the
+# corresponding bindings in csrc/bindings.cpp drop in lockstep with the sources
+# (a gated source whose binding stayed compiled would fail to link). See
+# scripts/build_inventory.py for the measured surface.
+option(FLASHRT_SLIM_BUILD
+       "Drop model/arch-specific kernels not needed by the target path" OFF)
+if(FLASHRT_SLIM_BUILD)
+  message(STATUS "Slim VLA build: ENABLED (model/arch-specific kernels gated out)")
+else()
+  message(STATUS "Slim VLA build: DISABLED (broad compatibility kernel set)")
+endif()
 if(FLASHRT_ENABLE_MOTUS)
   message(STATUS "Motus beta kernels: ENABLED")
 else()
@@ -1028,6 +1046,19 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
 endif()
 
 # ── Main module ──
+# flash_rt_kernels is the shared core pybind module. It currently compiles a
+# broad superset of kernels, including several model/architecture-specific
+# translation units that not every deployment needs (Qwen3.6/linear-attention,
+# SM120/NVFP4-named, Motus/video FP8-history). For VLA deployments on weaker
+# machines this is avoidable build latency.
+#
+# An incremental cleanup gates those model/arch-specific TUs behind explicit
+# CMake options so a slim build compiles only what a given hardware/model path
+# needs. This is COMPILE-TIME surface reduction only: it does not change kernel
+# math, launch params, dtype/dispatch policy, graph capture, or runtime
+# fallback. Default builds stay compatibility-oriented (broad set) until the
+# slim path is validated across SM89/SM120/Thor. See scripts/build_inventory.py
+# and tests/test_build_inventory.py for the measured per-target surface.
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
   csrc/kernels/norm.cu
@@ -1046,52 +1077,134 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/dit_bf16.cu
   csrc/kernels/attention_dit_bf16.cu
   csrc/quantize/fp8_block128_dequant.cu
-  csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
-  csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
   csrc/quantize/fp8_per_token_block_quant.cu
   csrc/quantize/tq_dequant_kv.cu
   csrc/quantize/wmma_probe.cu
   csrc/quantize/tq_dequant_cutlass.cu
   csrc/quantize/ada_layer_norm_fp8.cu
-  csrc/quantize/awq_quant_fp8_static_bf16.cu
-  csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
-  csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
-  csrc/quantize/bf16_rms_silu_ncdhw.cu
-  csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu
   csrc/quantize/bias_gelu_quantize_fp8.cu
   csrc/quantize/qkv_split_norm_rope_bf16.cu
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
-  csrc/kernels/causal_conv1d_qwen36.cu
-  csrc/kernels/linear_attention/gated_delta_wy_bf16.cu
-  csrc/kernels/linear_attention/gated_delta_wy_bf16_mma_fla.cu
-  csrc/kernels/linear_attention/gated_delta_wy_output_o_mma_fla.cu
-  csrc/kernels/linear_attention/gated_delta_wy_recompute_wu_mma_fla.cu
-  csrc/kernels/gated_deltanet_qwen36.cu
-  csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu
-  csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
   csrc/kernels/embedding_lookup_bf16.cu
-  csrc/kernels/qwen36_misc.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
   # and non-Nex-N2 builds never compile them. See the gated block after the
   # target definition.
   csrc/kernels/qwen3_qkv_post_proc.cu
-  csrc/kernels/fp4_w4a4_matvec_sm120.cu
-  csrc/kernels/fp4_w4a4_mma_sm120.cu
-  csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
-  csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
   csrc/kernels/bf16_matvec_qwen36.cu
   csrc/kernels/bf16_matmul_bf16.cu
-  csrc/kernels/bf16_matmul_qwen36.cu
-  csrc/kernels/bf16_matmul_qwen36_thor.cu
   csrc/attention/fmha_dispatch.cu
   csrc/bindings.cpp
 )
 set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+
+# ── Motus VAE FP8 quantize kernels (slim-gated) ──
+# These 5 TUs are used only by the Motus VAE FP8 path (the *_ncdhw* /
+# upsample / per-tensor AWQ-FP8 quant helpers; see flash_rt/models/motus/*).
+# They compile unconditionally today even on SM89 where no Motus model runs,
+# so a slim VLA build drops them. The matching bindings in csrc/bindings.cpp
+# are guarded by FLASHRT_HAVE_MOTUS_VAE_FP8 so they drop in lockstep (a gated
+# source whose binding stayed compiled would fail to link). The Motus Python
+# frontend already probes these with hasattr(), so a missing binding degrades
+# clearly instead of crashing on import.
+#
+# NOTE: ada_layer_norm_fp8.cu and bias_gelu_quantize_fp8.cu are intentionally
+# NOT in this group — they are shared (ada_layer_norm_fp8 is used by GROOT N1.7,
+# bias_gelu_quantize_fp8_static_bf16 by Melband-RoFormer), so they stay always
+# compiled. Do not fold them in without splitting their shared symbols out.
+if(NOT FLASHRT_SLIM_BUILD)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/quantize/awq_quant_fp8_static_bf16.cu
+    csrc/quantize/bf16_ndhwc_to_ncdhw_transpose.cu
+    csrc/quantize/bf16_quant_fp8_ncdhw_to_ndhwc.cu
+    csrc/quantize/bf16_rms_silu_ncdhw.cu
+    csrc/quantize/bf16_rms_silu_quant_fp8_ncdhw_to_ndhwc_v4.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_MOTUS_VAE_FP8=1)
+  message(STATUS "Motus VAE FP8 quantize kernels: ENABLED")
+else()
+  message(STATUS "Motus VAE FP8 quantize kernels: SKIPPED (slim build)")
+endif()
+
+# ── Qwen3.6 / linear-attention kernels (slim-gated) ──
+# These 10 TUs are used only by the Qwen3.6 family: Qwen3.6 dense/thor/spark
+# and Nex-N2 (the Qwen3.6-35B-A3B MoE). They cover causal-conv1d, the gated
+# DeltaNet / linear-attention WY stack, the Qwen3.6 fused RMSNorm-gated-SiLU,
+# Qwen3.6 misc helpers (partial-rope / argmax / tq-prepare / spec-accept /
+# legacy embedding wrapper), and the Qwen3.6 bf16 matmul (AB96 + legacy
+# wrapper + Thor MTP). A slim VLA build (Qwen3-VL etc.) needs none of them.
+# Their bindings in csrc/bindings.cpp are guarded by FLASHRT_HAVE_QWEN36_KERNELS
+# so they drop in lockstep (a gated source whose binding stayed compiled would
+# fail to link).
+#
+# NOTE: silu_mul_qwen36.cu and bf16_matvec_qwen36.cu are intentionally NOT in
+# this group — silu_mul_qwen36_bf16 is shared (Qwen3-dense / Higgs / Cosmos3)
+# and bf16_matvec_qwen36_bf16 is used by Higgs, so they stay always compiled.
+# The neutral helpers bf16_matmul_bf16.cu / embedding_lookup_bf16.cu also stay
+# (#112); only the legacy wrappers bf16_matmul_qwen36_bf16 /
+# qwen36_embedding_lookup_bf16 live inside the gated TUs. Do not fold the two
+# shared files in without splitting their shared symbols out.
+if(NOT FLASHRT_SLIM_BUILD)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/causal_conv1d_qwen36.cu
+    csrc/kernels/linear_attention/gated_delta_wy_bf16.cu
+    csrc/kernels/linear_attention/gated_delta_wy_bf16_mma_fla.cu
+    csrc/kernels/linear_attention/gated_delta_wy_output_o_mma_fla.cu
+    csrc/kernels/linear_attention/gated_delta_wy_recompute_wu_mma_fla.cu
+    csrc/kernels/gated_deltanet_qwen36.cu
+    csrc/kernels/rms_norm_gated_silu_qwen36.cu
+    csrc/kernels/qwen36_misc.cu
+    csrc/kernels/bf16_matmul_qwen36.cu
+    csrc/kernels/bf16_matmul_qwen36_thor.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_QWEN36_KERNELS=1)
+  message(STATUS "Qwen3.6 / linear-attention kernels: ENABLED")
+else()
+  message(STATUS "Qwen3.6 / linear-attention kernels: SKIPPED (slim build)")
+endif()
+
+# ── SM120 / NVFP4-named kernels (slim-gated, arch-macro keyed) ──
+# These TUs are named/built for SM120 NVFP4 but today compile unconditionally,
+# wasting build time on SM89 where they are unreachable. Each group compiles
+# when "NOT slim build OR <its existing arch macro is ON>": this keeps the
+# default SM89 surface broad (compatibility), drops the kernels only in a slim
+# SM89 build, and GUARANTEES they stay compiled on any SM120/NVFP4 build (slim
+# or not) where the arch macro is ON.
+#
+# Group A — fp4_w4a4_* SM120 NVFP4 W4A16 GEMM/GEMV. Their bindings are already
+# inside #ifdef ENABLE_CUTLASS_SM120_NVFP4_W4A16 in bindings.cpp, so on SM89 the
+# Python symbols never exist; only the source was compiling. No bindings change.
+# Keyed on the SAME condition that defines that macro (GPU_ARCH 120/121, see the
+# ENABLE_CUTLASS_SM120_NVFP4_W4A16 block below) — the macro is a compile-def, not
+# a CMake variable, so it must not be tested as one here.
+if(NOT FLASHRT_SLIM_BUILD OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/fp4_w4a4_matvec_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu)
+  message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: ENABLED")
+else()
+  message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: SKIPPED (slim build)")
+endif()
+
+# Group B — NVFP4 swizzle/quantize helpers. Their bindings are unguarded today
+# (exposed on SM89 but runtime-unreachable: every Python loader self-gates on
+# has_nvfp4()). Gating the sources requires guarding their bindings + includes
+# in lockstep; FLASHRT_HAVE_NVFP4_SWIZZLE drives that guard and is defined on
+# the same "NOT slim OR ENABLE_NVFP4" condition.
+if(NOT FLASHRT_SLIM_BUILD OR ENABLE_NVFP4)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
+    csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
+    csrc/kernels/silu_mul_to_nvfp4_swizzled.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_NVFP4_SWIZZLE=1)
+  message(STATUS "NVFP4 swizzle/quantize kernels: ENABLED")
+else()
+  message(STATUS "NVFP4 swizzle/quantize kernels: SKIPPED (slim build)")
+endif()
 
 # ── qwen3_5_moe family (Nex-N2 / Qwen3.6-35B-A3B) SM120 kernels ──
 # Gated: only compiled when explicitly enabled AND on a Blackwell (NVFP4)
