@@ -955,7 +955,7 @@ if(FLASHRT_BUILD_QWEN3_VL)
       csrc/gemm/fp8_gemv_m1_sm89.cu
       csrc/quantize/fp8_per_token_block_quant.cu
       csrc/kernels/qwen3_qkv_post_proc.cu
-      csrc/kernels/bf16_matmul_qwen36.cu)
+      csrc/kernels/bf16_matmul_bf16.cu)
   endif()
   pybind11_add_module(flash_rt_qwen3_vl_kernels ${QWEN3_VL_SOURCES})
   if(GPU_ARCH STREQUAL "89")
@@ -978,7 +978,7 @@ if(FLASHRT_BUILD_QWEN3_VL)
     >)
   target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
   if(GPU_ARCH STREQUAL "89")
-    # bf16_matmul_qwen36 (ViT bf16 linears on SM89) uses cuBLASLt.
+    # bf16_matmul_bf16 (ViT bf16 linears on SM89) uses cuBLASLt.
     target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cublasLt)
   endif()
   install(TARGETS flash_rt_qwen3_vl_kernels
@@ -1071,6 +1071,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/rms_norm_gated_silu_qwen36.cu
   csrc/kernels/silu_mul_qwen36.cu
   csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
+  csrc/kernels/embedding_lookup_bf16.cu
   csrc/kernels/qwen36_misc.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
@@ -1082,6 +1083,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
   csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
   csrc/kernels/bf16_matvec_qwen36.cu
+  csrc/kernels/bf16_matmul_bf16.cu
   csrc/kernels/bf16_matmul_qwen36.cu
   csrc/kernels/bf16_matmul_qwen36_thor.cu
   csrc/attention/fmha_dispatch.cu

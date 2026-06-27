@@ -139,6 +139,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/silu_mul_to_nvfp4_swizzled.cuh"
 #include "kernels/rms_norm_gated_silu_qwen36.cuh"
 #include "kernels/silu_mul_qwen36.cuh"
+#include "kernels/embedding_lookup_bf16.cuh"
 #include "kernels/qwen36_misc.cuh"
 #ifdef FLASHRT_HAVE_QWEN35MOE
 #include "kernels/qwen35moe_layout.cuh"
@@ -157,6 +158,7 @@ extern "C" int cutlass_int8_rowwise_bf16out_t64x128(
 #include "kernels/w16a16_gemm_sm120.cuh"
 #endif  // FLASHRT_HAVE_QWEN35MOE
 #include "kernels/bf16_matvec_qwen36.cuh"
+#include "kernels/bf16_matmul_bf16.cuh"
 #include "kernels/bf16_matmul_qwen36.cuh"
 #include "kernels/bf16_matmul_qwen36_thor.cuh"
 #include "kernels/fp4_w4a4_matvec_sm120.cuh"
@@ -4181,6 +4183,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
     // times. Replaces the K-loop matvec at lin-attn unquantized
     // projections (in_proj_qkv / in_proj_z / out_proj). Stream-invariant
     // and CUDA Graph compatible.
+    // Neutral name for the model-neutral small-M bf16 matmul (#112). The
+    // legacy bf16_matmul_qwen36_bf16 below is a thin wrapper over this same
+    // implementation; both bindings are kept so existing call sites keep
+    // working while non-Qwen3.6 paths migrate to the neutral name.
+    m.def("bf16_matmul_bf16",
+        [](uintptr_t x, uintptr_t W, uintptr_t out,
+           int M, int N, int K, uintptr_t stream) {
+            flash_rt::kernels::bf16_matmul_bf16(
+                reinterpret_cast<const __nv_bfloat16*>(x),
+                reinterpret_cast<const __nv_bfloat16*>(W),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                M, N, K, to_stream(stream));
+        },
+        py::arg("x"), py::arg("W"), py::arg("out"),
+        py::arg("M"), py::arg("N"), py::arg("K"), py::arg("stream") = 0);
+
     m.def("bf16_matmul_qwen36_bf16",
         [](uintptr_t x, uintptr_t W, uintptr_t out,
            int M, int N, int K, uintptr_t stream) {
@@ -4256,6 +4274,22 @@ PYBIND11_MODULE(flash_rt_kernels, m) {
         },
         py::arg("x"), py::arg("W_ab"), py::arg("out_ab"),
         py::arg("M"), py::arg("stream") = 0);
+
+    // Neutral name for the model-neutral bf16 embedding lookup (#112). The
+    // legacy qwen36_embedding_lookup_bf16 below is a thin wrapper over this
+    // same implementation; both bindings are kept so existing call sites keep
+    // working while non-Qwen3.6 paths migrate to the neutral name.
+    m.def("embedding_lookup_bf16",
+        [](uintptr_t token_ids, uintptr_t embed, uintptr_t out,
+           int rows, int hidden, uintptr_t stream) {
+            flash_rt::kernels::embedding_lookup_bf16(
+                reinterpret_cast<const int64_t*>(token_ids),
+                reinterpret_cast<const __nv_bfloat16*>(embed),
+                reinterpret_cast<__nv_bfloat16*>(out),
+                rows, hidden, to_stream(stream));
+        },
+        py::arg("token_ids"), py::arg("embed"), py::arg("out"),
+        py::arg("rows"), py::arg("hidden"), py::arg("stream") = 0);
 
     m.def("qwen36_embedding_lookup_bf16",
         [](uintptr_t token_ids, uintptr_t embed, uintptr_t out,
