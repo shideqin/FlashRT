@@ -29,7 +29,7 @@ def load_model(
     autotune: int = 3,              # 0=off, 3=default, 5+=thorough
     recalibrate: bool = False,
     weight_cache: bool = True,      # JAX only
-    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video"
+    config: str = "pi05",           # "pi05" | "pi0" | "groot" | "groot_n17" | "pi0fast" | "motus" | "wan22_ti2v_5b" | "cosmos3_video" | "cosmos3_edge"
     device=None,                    # reserved
     # Pi0-FAST-specific:
     decode_cuda_graph: bool = False,
@@ -113,6 +113,12 @@ Returns a `VLAModel` wrapping the appropriate frontend for the detected
   compare_ref=..., return_metadata=...)`, returning the denoised vision
   latent; `predict()` is not part of this API. Precision is selected with
   `load_model(..., use_fp8=True|False)`. See `docs/cosmos3_video_usage.md`.
+- `config="cosmos3_edge"` is the Thor integration for NVIDIA Cosmos Framework.
+  It exposes `set_prompt(input_json=...)` or `set_prompt(sample=...)`, then
+  `infer(output_dir=..., vae_path=..., cosmos_root=...)`. The official backend
+  establishes the end-to-end reference; the fixture-backed FlashRT backend
+  validates and benchmarks the optimized denoise boundary. See
+  `docs/cosmos3_edge_thor.md`.
 - `config="groot_n17"` is registered for `framework="torch"` on
   `hardware in {"thor", "rtx_sm120", "rtx_sm89"}`. On RTX,
   `rtx_sm120` resolves through the historical shared RTX registration and
@@ -376,12 +382,43 @@ from flash_rt.runtime.rtc import (
     AsyncChunkRunner,
     RTCStats,
 )
+
+from flash_rt.runtime import (
+    AsyncTemporalFusionRunner,
+    FusedChunk,
+    ObservationSnapshotter,
+    PredictionTicket,
+    TemporalFusionBuffer,
+    TemporalFusionConfig,
+    TemporalFusionStats,
+    TimedActionChunk,
+)
+
+from flash_rt.runtime.vlash import (
+    AsyncVLAShRunner,
+    VLAShChunkResult,
+    VLAShConfig,
+    VLAShStats,
+)
 ```
 
-RTC-lite is a beta inference scheduling utility for action-chunk
+The legacy async chunk runner is a beta inference scheduling utility for action-chunk
 policies. It does not change model numerics or calibration; it only
 serves action chunks at a fixed controller rate while a background worker
 prepares the next chunk. See `docs/rtc_lite_design.md`.
+
+The temporal-fusion runner is an opt-in scheduling policy that retains raw
+predicted chunks, aligns them on the controller-step timeline, and fuses up to
+`TemporalFusionConfig.max_chunks` overlapping predictions with exponential
+position-difference weights. It supports latency- and state-based chunk
+switching without changing model kernels or calibration. See
+`docs/rtc_temporal_fusion.md` for the adapter contract, configuration, deadline
+behavior, and real Pi0.5 checkpoint gate.
+
+`AsyncVLAShRunner` is an optional host-side runtime for projected-state
+action-chunk scheduling. It estimates a future robot state from the active
+chunk, injects that state into the next observation, and activates the completed
+chunk from index zero. See `docs/vlash.md`.
 
 ### `flash_rt.flash_rt_fa2`
 

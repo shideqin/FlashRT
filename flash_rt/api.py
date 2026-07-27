@@ -299,7 +299,20 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
                use_fp16=False,
                use_fp8=True,
                state_prompt_mode="exact",
-               state_prompt_fixed_max_len=None):
+               state_prompt_fixed_max_len=None,
+               *,
+               mmproj_path=None,
+               backend="cpu",
+               action_steps=None,
+               action_dim=None,
+               lib_path=None,
+               n_ctx=0,
+               n_threads=0,
+               temp=0.8,
+               top_k=40,
+               top_p=0.9,
+               seed=1,
+               max_tokens=512):
     """Load a FlashRT model.
 
     Args:
@@ -318,9 +331,13 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         weight_cache: if True (default), cache FP8-quantized weights to disk
             after first load. Only affects JAX.
         config: model config name: "pi05", "pi0", "groot", "groot_n17",
-            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video".
+            "pi0fast", "motus", "wan22_ti2v_5b", "cosmos3_video",
+            "cosmos3_edge".
             "cosmos3_video" is a non-VLA text2video denoise model: drive it with
             set_prompt(ref=<reference dump>) + infer(...), not predict().
+            "cosmos3_edge" is the official Cosmos Framework Thor baseline
+            runner: drive it with set_prompt(sample=... or input_json=...) +
+            infer(output_dir=..., vae_path=...).
         device: ignored (auto-detects GPU). Reserved for future multi-GPU.
         decode_cuda_graph: Pi0-FAST only. Capture action-phase decode as CUDA
             Graph for max throughput (trades startup time for per-token speed).
@@ -369,7 +386,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         use_fp8: Enable FP8 execution where the selected frontend supports
             an FP8/BF16 switch. Defaults to True to preserve existing
             performance-oriented behavior.
-        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5 on RTX
+        use_fp16: Opt-in non-quantized full-FP16 path for Pi0.5 on Thor/RTX
             SM120/SM89, GROOT N1.6 on Thor/RTX SM120, and GROOT N1.7 on
             Thor/RTX SM120/SM89. Only valid with ``use_fp8=False``; an A/B
             reference against the quantized default. On GROOT N1.7 the
@@ -419,15 +436,77 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     Returns:
         VLAModel instance with .predict() method.
     """
-    if config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
-                      "motus", "wan22_ti2v_5b", "cosmos3_video", "nexn2"):
+    # Qwen3-VL is a chat-style VLM, not a VLA predict(images, ...) model. It
+    # is registered in _PIPELINE_MAP for resolve_pipeline_class/discovery, but
+    # load_model's VLAModel wrapper would expose the wrong runtime surface.
+    if config == "qwen3_vl":
+        raise NotImplementedError(
+            "config='qwen3_vl' is a chat-style VLM and is not served through "
+            "load_model's VLA wrapper. Construct the target frontend directly:\n"
+            "    from flash_rt.frontends.torch.qwen3_vl_fp8_sm89_multimodal "
+            "import Qwen3VlFp8Sm89Frontend\n"
+            "    from flash_rt.frontends.torch.qwen3_vl_rtx import "
+            "Qwen3VlTorchFrontendRtx\n"
+            "See docs/qwen3_vl_fp8_sm89.md and docs/qwen3_vl_nvfp4.md.")
+
+    if framework == "jetson_pi":
+        if config not in ("pi0", "pi05", "llm", "mllm"):
+            raise ValueError(
+                f"Unknown Jetson-PI config: {config}. "
+                "Supported: pi0, pi05, llm, mllm")
+    elif config not in ("pi05", "groot", "groot_n17", "pi0", "pi0fast",
+                      "motus", "wan22_ti2v_5b", "cosmos3_video",
+                      "cosmos3_edge", "nexn2"):
         raise ValueError(
             f"Unknown config: {config}. "
             f"Supported: pi05, groot, groot_n17, pi0, pi0fast, motus, "
-            f"wan22_ti2v_5b, cosmos3_video, nexn2")
-    if framework not in ("torch", "jax"):
+            f"wan22_ti2v_5b, cosmos3_video, cosmos3_edge, nexn2")
+    if framework not in ("torch", "jax", "jetson_pi"):
         raise ValueError(
-            f"Unknown framework: {framework}. Supported: torch, jax")
+            f"Unknown framework: {framework}. Supported: torch, jax, jetson_pi")
+
+    # Drives the Jetson-PI provider through frt_model_runtime_v1 via ctypes.
+    # No torch/jax or GPU architecture detection is involved. The action chunk
+    # shape is passed explicitly by the caller (the verified pi0_base is 50x32).
+    if framework == "jetson_pi":
+        if config == "llm":
+            from flash_rt.frontends.jetson_pi.llm import LlmJetsonPiFrontend
+            return LlmJetsonPiFrontend(
+                checkpoint,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        if config == "mllm":
+            from flash_rt.frontends.jetson_pi.mllm import MllmJetsonPiFrontend
+            return MllmJetsonPiFrontend(
+                checkpoint,
+                mmproj_path=mmproj_path,
+                backend=backend,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                temp=temp,
+                top_k=top_k,
+                top_p=top_p,
+                seed=seed,
+                max_tokens=max_tokens,
+                lib_path=lib_path)
+        # default / "pi0": VLA path
+        from flash_rt.frontends.jetson_pi.pi0 import Pi0JetsonPiFrontend
+        pipe = Pi0JetsonPiFrontend(
+            checkpoint,
+            mmproj_path=mmproj_path,
+            backend=backend,
+            num_views=num_views,
+            action_steps=action_steps,
+            action_dim=action_dim,
+            lib_path=lib_path)
+        return VLAModel(pipe, framework)
 
     # When use_fp4=True, the default resolves to the best-known production
     # FP4 config (full 18 encoder FFN layers + AWQ + P1 split-GU). Passing
@@ -487,6 +566,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         if use_fp8:
             raise ValueError("use_fp16=True requires use_fp8=False")
         if (config, framework, arch) not in {
+            ("pi05", "torch", "thor"),
             ("pi05", "torch", "rtx_sm120"),
             ("pi05", "torch", "rtx_sm89"),
             ("groot", "torch", "thor"),
@@ -497,7 +577,7 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
         }:
             raise ValueError(
                 "use_fp16=True is currently experimental and only supports "
-                "('pi05', 'torch', 'rtx_sm120'/'rtx_sm89'), "
+                "('pi05', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89'), "
                 "('groot', 'torch', 'thor'/'rtx_sm120'), and "
                 "('groot_n17', 'torch', 'thor'/'rtx_sm120'/'rtx_sm89')")
 
@@ -532,10 +612,14 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
             "use_fp16=True together with use_fp8=False.")
 
     if use_fp16:
-        # GROOT N1.6 Thor full-FP16 reference: the same fully-kernelized,
-        # CUDA-graph pipeline as the FP8 production frontend, with the GEMMs run
-        # in FP16 instead of per-tensor FP8 (an A/B accuracy baseline).
-        if config == "groot" and framework == "torch" and arch == "thor":
+        if config == "pi05" and framework == "torch" and arch == "thor":
+            # Pi0.5 Thor keeps FP8 and full-FP16 in the same frontend; the
+            # use_fp8=False kwarg below selects the FP16 kernel path.
+            pass
+        elif config == "groot" and framework == "torch" and arch == "thor":
+            # GROOT N1.6 Thor full-FP16 reference: the same fully-kernelized,
+            # CUDA-graph pipeline as the FP8 production frontend, with the
+            # GEMMs run in FP16 instead of per-tensor FP8.
             from flash_rt.frontends.torch.groot_thor_fp16 import (
                 GrootTorchFrontendThorFP16,
             )
@@ -638,6 +722,10 @@ def load_model(checkpoint, framework="torch", num_views=2, autotune=3,
     elif config == "wan22_ti2v_5b":
         if "autotune" in sig.parameters:
             kwargs["autotune"] = autotune
+    elif config == "cosmos3_edge":
+        # Official Cosmos Framework baseline runner. Runtime knobs such as
+        # output_dir, seed, benchmark, and local Wan VAE path are infer() args.
+        pass
     else:
         # pi05, pi0 — both Thor and rtx variants take (checkpoint, num_views, autotune)
         # or (checkpoint, num_views). Feature-detect.

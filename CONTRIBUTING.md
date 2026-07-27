@@ -172,8 +172,9 @@ live in [`docs/exec_contract.md`](docs/exec_contract.md) §9; the essentials:
   host, never in the contract.
 - GPU/model state stays owned by the frontend. The serving layer holds metadata
   only (token journal, cache plan, episode bookkeeping).
-- Capture, calibration, and warmup stay in the Python frontend; the contract
-  only **adopts** the resulting instantiated graph and owns replay-time.
+- Capture, calibration, and warmup stay in the setup producer or model
+  frontend, which may be Python or native C++; `exec/`, `runtime/`, Nexus and
+  serving hosts only adopt or consume the resulting graph/runtime handle.
 - `exec/` is a top-level sibling of `csrc/` with zero `csrc` dependency. It must
   not include or link kernel sources.
 - Integration is additive and opt-in (e.g. `FLASHRT_QWEN36_USE_EXEC`): the
@@ -184,6 +185,80 @@ live in [`docs/exec_contract.md`](docs/exec_contract.md) §9; the essentials:
 `serving/qwen36_agent` is the reference example that satisfies every item above;
 use it as the comparison point when adding a new serving host.
 
+### Runtime Export And Model Runtime
+
+The `runtime/` hand-off ABI and the `cpp/` native runtime layers follow the
+same mechanism-not-policy rule. Design:
+[`docs/cpp_runtime_design.md`](docs/cpp_runtime_design.md); interface:
+[`docs/model_runtime_api.md`](docs/model_runtime_api.md); norms:
+[`docs/runtime_contract.md`](docs/runtime_contract.md). The essentials
+reviewers hold every PR to:
+
+- Optional model-runtime capabilities append only to the main struct tail and
+  require an independent size probe. Never grow the embedded verbs table.
+- Extension IDs and tables are core-owned. Provider/model/backend names,
+  private registries, post-finish table attachment, and parallel identity/hash
+  implementations are rejected.
+- One runtime publishes one selected execution authority: legacy stages,
+  generic stages, or step-only. A new capability must include authority,
+  malformed-table, owner-lifetime, fingerprint and baseline-prefix tests.
+- Metadata-only exports are zero-resource identity/lifetime anchors. They must
+  not fake an exec context or imply snapshot/restore support.
+
+- `runtime/` headers are the ONLY frozen surface and are additive-only after
+  v1: append fields/enums, never reorder or remove. Export revisions follow
+  their documented version policy; model-runtime v1 tails use independent
+  size probes without changing the required prefix. Nothing under `cpp/` is
+  ABI.
+- The contract is data first, verbs as sugar: ports (with update class) and
+  the stage DAG are the standard face; `step` is convenience, never the
+  center. Do not add scenario fields, model names, or scheduling concepts to
+  the structs.
+- `STAGED` is a promise: the port accepts hot updates. A producer that cannot
+  hot-update an input declares `SETUP` or omits the port — never
+  advertise-and-refuse.
+- Hot-path discipline is testable, not aspirational: SWAP writes, `set_input`
+  / `get_output`, and the tick never `cudaMalloc`/`cudaFree`, never
+  recapture, never rebind graph pointers. Staging uses fixed-capacity pools
+  created with the runtime; over-capacity input is a hard error, not a
+  fallback allocation.
+- Identity is computed once, by the builder: producer pairs + graph names +
+  region layout + port schema + bound windows. A change to any of these must
+  change the fingerprint; the advisory cadence hint must not.
+- Graph-cache mechanism (`frt_graph_evict` / `evict_lru` / `variant_count`)
+  lives in `exec/`; eviction and budget policy live in the host. Evict only
+  at a safe point — never while a variant may be in flight.
+- `cpp/` altitude rule: `modalities/` knows pixels and tensors, never models;
+  `families/` knows a model class's IO shape, never buffer names;
+  `models/<m>/` binds names and constants, never re-implements a transform.
+- Subgraph cuts are producer-authored: capture hooks register under
+  `flash_rt/subgraphs/` and leave pipeline logic untouched; the C++ runtime
+  consumes the declared `stages[]` and never assumes graph names (the verb
+  override path). Rules and examples:
+  [`docs/subgraph_stage_plans.md`](docs/subgraph_stage_plans.md). A structural
+  cut is a re-ordering, not an approximation — split-vs-full replay must stay
+  bit-exact (`cpp/tests/gate_pi05_model_runtime_export.py` is the gate).
+
+Native C++ model work is opt-in under `FLASHRT_ENABLE_NATIVE_CPP` and an
+explicit model-level option. Hardware targets require that model option; the
+native umbrella alone must not compile any model source or test. A model PR
+must leave the default Python build graph and every existing common `csrc`
+symbol unchanged. Native-only operation gaps belong in `csrc/native_cpp/` and
+must remain model-independent, hidden from the producer library's dynamic
+symbol surface, and unreachable when the option is disabled. Do not modify a
+shared kernel's math, workspace stride, signature or packaging to satisfy one
+native frontend. Propose a genuinely common correction separately with a
+caller inventory, cross-model numerical tests and cache/artifact compatibility
+analysis.
+
+Reuse an existing common operation whenever its contract matches the native
+call site. Do not add a shadow implementation merely to change rounding or
+reduction behavior. A native-only operation is justified only when the common
+surface lacks the required signature, layout, workspace contract or host-free
+setup capability. Numerical parity must be checked against the unchanged
+current producer; matching a branch-local frozen producer that used the same
+shadow implementation is not sufficient evidence.
+
 ### Calibration And Precision
 
 FP8/NVFP4 changes must preserve the calibration cache contract described in
@@ -193,6 +268,12 @@ calibration, or graph capture behavior, include a precision comparison:
 - cosine vs the relevant reference when a fixture exists
 - action sanity check for quickstart-only paths
 - latency before/after for performance-sensitive changes
+
+A native calibration path must replay the model's one semantic pipeline. The
+target may provide observers, packing and private scratch, but must not own a
+second model forward. Dataset iteration and sample selection stay in the host;
+artifact identity must bind checkpoint, tokenizer, hardware, dtype and all
+shape-affecting setup fields.
 
 ### Performance Measurement
 
