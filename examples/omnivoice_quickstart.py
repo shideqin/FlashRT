@@ -28,7 +28,7 @@ _model = None
 _vcp_cache = {}
 
 
-def _load(ckpt, cfg_ratio=0.05, bookend=False):
+def _load(ckpt, cfg_ratio=1.0, bookend=False):
     global _model
     import torch
     from omnivoice import OmniVoice
@@ -50,7 +50,7 @@ def _get_vcp(ref_audio, ref_text, denoise=True, preprocess=True):
     return _vcp_cache[key]
 
 
-def _generate(text, vcp=None, **kwargs):
+def _generate(text, vcp=None, language=None, **kwargs):
     import torch
     from omnivoice import OmniVoiceGenerationConfig
 
@@ -61,7 +61,8 @@ def _generate(text, vcp=None, **kwargs):
     g = OmniVoiceGenerationConfig(**kwargs)
     t0 = time.perf_counter()
     audio = np.array(_model.generate(
-        text=text, generation_config=g, voice_clone_prompt=vcp)[0]).squeeze()
+        text=text, language=language, generation_config=g,
+        voice_clone_prompt=vcp)[0]).squeeze()
     elapsed = time.perf_counter() - t0
     dur = len(audio) / 24000
     print(f"[FlashRT] {dur:.2f}s audio in {elapsed*1000:.0f}ms "
@@ -82,8 +83,8 @@ def _build_parser():
     p.add_argument("--guidance-scale", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=42, help="Random seed, -1 for random")
     p.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier")
-    p.add_argument("--cfg-ratio", type=float, default=0.05,
-                   help="Fraction of steps using BF16 CFG (0.0-1.0)")
+    p.add_argument("--cfg-ratio", type=float, default=1.0,
+                   help="Exact BF16 CFG fraction; 1.0 preserves PyTorch quality")
     p.add_argument("--bookend", action="store_true",
                    help="Use BF16 CFG on the final step")
     p.add_argument("--output", default="output.wav", help="Output WAV path")
@@ -125,7 +126,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.duration:
         gen_kwargs["duration"] = args.duration
 
-    audio = _generate(args.text, vcp=vcp, seed=args.seed, **gen_kwargs)
+    language = None if args.language == "auto" else args.language
+    audio = _generate(
+        args.text, vcp=vcp, language=language, seed=args.seed, **gen_kwargs)
 
     if args.speed != 1.0:
         import librosa

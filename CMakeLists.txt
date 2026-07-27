@@ -926,6 +926,9 @@ if(FLASHRT_ENABLE_OMNIVOICE)
   endif()
   pybind11_add_module(flash_rt_omnivoice
     csrc/omnivoice_extra_bindings.cpp
+    csrc/kernels/omnivoice/omnivoice_bf16_dual_swiglu.cu
+    csrc/kernels/omnivoice/omnivoice_bf16_matmul.cu
+    csrc/kernels/omnivoice/omnivoice_exact_attention.cu
     csrc/kernels/omnivoice/omnivoice_cfg_combine.cu
     csrc/kernels/omnivoice/omnivoice_qk_norm_rope.cu)
   set_target_properties(flash_rt_omnivoice PROPERTIES
@@ -934,7 +937,22 @@ if(FLASHRT_ENABLE_OMNIVOICE)
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
   target_include_directories(flash_rt_omnivoice PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass/examples/45_dual_gemm)
+  execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c
+      "import os, torch; print(os.path.join(os.path.dirname(torch.__file__), 'include'))"
+    OUTPUT_VARIABLE OMNIVOICE_TORCH_INCLUDE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    RESULT_VARIABLE OMNIVOICE_TORCH_INCLUDE_RESULT)
+  if(NOT OMNIVOICE_TORCH_INCLUDE_RESULT EQUAL 0 OR
+     NOT EXISTS "${OMNIVOICE_TORCH_INCLUDE}/ATen")
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_OMNIVOICE requires the installed PyTorch headers.")
+  endif()
+  target_include_directories(flash_rt_omnivoice PRIVATE
+    ${OMNIVOICE_TORCH_INCLUDE})
   target_compile_options(flash_rt_omnivoice PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3
@@ -942,7 +960,7 @@ if(FLASHRT_ENABLE_OMNIVOICE)
       -U__CUDA_NO_BFLOAT162_OPERATORS__
       ${GPU_GENCODE}
     >)
-  target_link_libraries(flash_rt_omnivoice PRIVATE CUDA::cudart)
+  target_link_libraries(flash_rt_omnivoice PRIVATE CUDA::cudart CUDA::cublasLt)
   install(TARGETS flash_rt_omnivoice LIBRARY DESTINATION flash_rt)
   message(STATUS "OmniVoice TTS SM120 kernels: ENABLED")
 else()

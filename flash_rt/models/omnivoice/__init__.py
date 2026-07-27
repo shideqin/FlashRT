@@ -1,7 +1,7 @@
 """FlashRT — OmniVoice TTS model pipeline.
 
-Mixed BF16 CFG + FP4 noCFG acceleration preserves audio quality at 5.0x
-throughput on Blackwell SM120 GPUs.
+The default exact-BF16 profile preserves the PyTorch token and waveform path.
+Lower CFG ratios opt into a faster BF16/FP4 quality tradeoff.
 
 Per the unified API contract:
     inject()       — patch OmniVoice model for FlashRT acceleration

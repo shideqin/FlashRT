@@ -1,7 +1,7 @@
 """serving/omnivoice_agent — TTS inference server for OmniVoice.
 
 FastAPI server exposing POST /predictions with base64 WAV output.
-Uses flash_rt.models.omnivoice for BF16+FP4 hybrid acceleration.
+Uses the exact BF16 FlashRT profile by default.
 
 Run:
     export OMNIVOICE_CHECKPOINT=/path/to/OmniVoice
@@ -48,7 +48,7 @@ class PredictRequest(BaseModel):
     input: PredictInput
 
 
-def _load(ckpt, cfg_ratio=0.05, bookend=False):
+def _load(ckpt, cfg_ratio=1.0, bookend=False):
     global _model
     import torch
     from omnivoice import OmniVoice
@@ -190,7 +190,10 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = argparse.ArgumentParser(description="OmniVoice FlashRT serve")
     parser.add_argument("--checkpoint", required=True, help="Path to OmniVoice checkpoint")
-    parser.add_argument("--cfg-ratio", type=float, default=0.05)
+    parser.add_argument(
+        "--cfg-ratio", type=float, default=1.0,
+        help="Exact BF16 CFG fraction; values below 1 opt into the "
+             "non-exact FP4/no-CFG quality tradeoff")
     parser.add_argument("--bookend", action="store_true")
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

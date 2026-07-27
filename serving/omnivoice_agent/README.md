@@ -1,7 +1,8 @@
 # serving/omnivoice_agent
 
-TTS inference server for OmniVoice on FlashRT with BF16 + FP4 hybrid
-acceleration.
+TTS inference server for OmniVoice on FlashRT. The default profile uses the
+exact BF16 engine for every CFG step; lower `--cfg-ratio` values explicitly
+opt into the faster BF16 + FP4 quality tradeoff.
 
 This directory is the policy layer above the FlashRT execution contract.
 It owns the FastAPI HTTP surface, WAV framing, and request serialisation.
@@ -12,13 +13,13 @@ patches OmniVoice for FlashRT acceleration.
 
 ```
 serving/omnivoice_agent/server.py          policy: HTTP, audio framing, serialisation
-  └─ flash_rt.models.omnivoice.inject()    acceleration: BF16+FP4 hybrid MaskGIT loop
-       ├─ FlashRTLlmBF16                    BF16 CFG forward (step 1)
-       └─ FlashRTLlm                        FP4 noCFG forward (steps 2-32)
+  └─ flash_rt.models.omnivoice.inject()    accelerated MaskGIT loop
+       ├─ FlashRTLlmBF16                    exact BF16 CFG (default: all steps)
+       └─ FlashRTLlm                        optional FP4 noCFG tail
 ```
 
 Single stream: TTS requests are serialised (one model instance). The engine
-uses CUDA Graph for FP4 forward and fused FlashRT kernels throughout.
+uses CUDA Graph and fused FlashRT kernels throughout.
 
 ## Quickstart
 
@@ -65,11 +66,15 @@ curl -s http://127.0.0.1:8000/predictions \
 
 `GET /health` reports server status.
 
-## Measured (RTX 5060 Ti, SM120, ns=32, gs=2.0)
+## Measured exact profile (RTX 5060 Ti, SM120, ns=32, gs=2.0)
 
-- Latency: 100 ms | Speedup: 5.0x | RTF: 0.032
-- VRAM: 2.0 GB (70% of PyTorch)
-- Mel-cosine: 0.9961 vs PyTorch BF16 reference
+- Warm latency: 130.09 ms | Speedup: 3.07x | RTF: 0.1041
+- Token match: 100%
+- Waveform and Mel cosine: 1.000000 vs PyTorch BF16 reference
+
+The former `cfg_ratio=0.05` hybrid measured about 100 ms and Mel cosine
+0.9961. It remains available as an explicit speed/quality option, but is not
+the server default because it does not meet a `cosine >= 0.999` contract.
 
 See `docs/PERFORMANCE_OMNIVOICE.md` for full performance specifications.
 
