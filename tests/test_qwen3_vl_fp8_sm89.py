@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+from pathlib import Path
 
 
 def test_frontend_imports():
@@ -15,6 +16,7 @@ def test_frontend_imports():
     text_cls = m.Qwen3VlFp8Sm89TextFrontend
     assert hasattr(m, 'Qwen3VlFp8Sm89TextFrontend')
     assert 'max_prefill_seq' in inspect.signature(text_cls).parameters
+    assert 'max_decode_graphs' in inspect.signature(text_cls).parameters
     assert 'run_lm_head' in inspect.signature(
         text_cls.forward_hidden_prefill_fp8_blockscaled).parameters
     mm = importlib.import_module(
@@ -24,11 +26,13 @@ def test_frontend_imports():
     assert 'max_prefill_seq' in inspect.signature(
         cls).parameters
     for name in ('fuse_gate_up', 'fuse_qk_postproc', 'use_fp8_lm_head',
-                 'vision_bf16_first_blocks'):
+                 'vision_bf16_first_blocks', 'max_prefill_graphs',
+                 'max_decode_graphs'):
         assert name in inspect.signature(cls).parameters
     for name in (
         'prefill_graph', 'decode_step_with_graph',
-        'warmup_decode_graphs', 'generate',
+        'warmup_decode_graphs', 'clear_graphs', 'graph_cache_stats',
+        'generate',
     ):
         assert hasattr(cls, name)
 
@@ -41,6 +45,23 @@ def test_default_prefill_limit_matches_max_seq_without_cuda():
 
     assert _resolve_max_prefill_seq(1234, None) == 1234
     assert _resolve_max_prefill_seq(1234, 256) == 256
+
+
+def test_bench_tile_bindings_are_dev_gated():
+    repo = Path(__file__).resolve().parents[1]
+    bindings = (repo / 'csrc' / 'qwen3_vl_bindings.cpp').read_text()
+    cmake = (repo / 'CMakeLists.txt').read_text()
+
+    start = bindings.index('#ifdef ENABLE_QWEN3_VL_DEV_KERNELS')
+    end = bindings.index('#endif', start)
+    dev_block = bindings[start:end]
+    production_surface = bindings[:start] + bindings[end:]
+
+    assert 'm.def("bench_"' in dev_block
+    assert 'BIND_GEMM_TILE(' in dev_block
+    assert 'm.def("bench_"' not in production_surface
+    assert 'option(FLASHRT_ENABLE_QWEN3_VL_DEV_KERNELS' in cmake
+    assert 'ENABLE_QWEN3_VL_DEV_KERNELS=1' in cmake
 
 
 def test_multimodal_prefill_graph_falls_back_to_eager_without_pg_key():

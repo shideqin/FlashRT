@@ -137,6 +137,24 @@ set(FA2_HDIMS "64;96;128;256" CACHE STRING
     "Semicolon-separated FA2 head_dim instantiations to build. Qwen3-VL 2B vision uses 64; other shipped models use 96 and 256.")
 set(FA2_DTYPES "fp16;bf16" CACHE STRING
     "Semicolon-separated FA2 dtype instantiations to build. Pi0 uses fp16; pi0.5/groot use bf16.")
+option(FLASHRT_ENABLE_NATIVE_CPP
+       "Build Python-free operation libraries for native C++ consumers" OFF)
+option(FLASHRT_BUILD_FA2_PYTHON_ADAPTER
+       "Build the vendored FA2 Python adapter when FA2 is available" ON)
+
+# Cosmos3 deployment kernels are model- and architecture-specific. Keep them
+# out of the shared modules unless the corresponding Thor path is requested.
+option(FLASHRT_ENABLE_COSMOS3_EDGE
+       "Build Cosmos3-Edge AV kernels and bindings for Jetson AGX Thor" OFF)
+option(FLASHRT_ENABLE_COSMOS3_REASONER
+       "Build Cosmos3 Reasoner kernels and bindings for Jetson AGX Thor" OFF)
+if((FLASHRT_ENABLE_COSMOS3_EDGE OR FLASHRT_ENABLE_COSMOS3_REASONER) AND
+   NOT GPU_ARCH STREQUAL "110")
+  message(FATAL_ERROR
+    "Cosmos3 kernels require GPU_ARCH=110; current GPU_ARCH=${GPU_ARCH}. "
+    "Disable FLASHRT_ENABLE_COSMOS3_EDGE/FLASHRT_ENABLE_COSMOS3_REASONER "
+    "for non-Thor builds.")
+endif()
 
 # Motus beta integration. Motus-specific kernels are additive and must keep
 # their symbols prefixed with ``motus_``. Keeping a build tag lets the public
@@ -157,6 +175,8 @@ option(FLASHRT_ENABLE_QWEN35MOE
 # module so flash_rt_kernels.so stays stable; OFF by default.
 option(FLASHRT_BUILD_QWEN3_VL
        "Build Qwen3-VL kernels into a separate flash_rt_qwen3_vl_kernels module" OFF)
+option(FLASHRT_ENABLE_QWEN3_VL_DEV_KERNELS
+       "Expose Qwen3-VL bench/probe pybind symbols for kernel development" OFF)
 # MelBandRoformer audio source separation kernels (FP8 fused kernels for
 # BF16-in / FP8-out norm, QKV+RoPE, gated attention quant, residual+norm).
 # OFF by default; enable with -DFLASHRT_ENABLE_MELBAND_ROFORMER=ON.
@@ -168,6 +188,24 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
+# explicit option so deployment builds that do not serve audio can remove the
+# TU and its binding in lockstep.
+option(FLASHRT_ENABLE_AUDIO_CODEBOOK
+       "Build shared delayed-codebook helper kernels into flash_rt_kernels" ON)
+# MiniMax-Remover — builds flash_rt_minimax_remover.so with model-specific
+# FP8/NVFP4 transformer and VAE fused kernels. OFF by default; enable with
+# -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON on Blackwell only.
+option(FLASHRT_ENABLE_MINIMAX_REMOVER
+       "Build MiniMax-Remover FP8/NVFP4 kernels in flash_rt_minimax_remover" OFF)
+if(FLASHRT_ENABLE_MINIMAX_REMOVER AND NOT ENABLE_NVFP4)
+  message(FATAL_ERROR
+    "FLASHRT_ENABLE_MINIMAX_REMOVER requires Blackwell NVFP4 support "
+    "(GPU_ARCH=120/120a/121/121a). The MiniMax-Remover module contains "
+    "SM120 FP8/NVFP4 kernels and must not be enabled for GPU_ARCH=${GPU_ARCH}.")
+endif()
+option(FLASHRT_ENABLE_SM120_DEV_KERNELS
+       "Build SM120 probe/tilesweep tuning kernels and public bindings" OFF)
 # ── Slim build for VLA deployments ──
 # OFF by default: the standard build keeps the broad, compatibility-oriented
 # kernel set it has today. Turn ON (-DFLASHRT_SLIM_BUILD=ON) to drop
@@ -218,7 +256,8 @@ if(MSVC)
 endif()
 
 # ── Paths ──
-set(CUTLASS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass)
+set(CUTLASS_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/cutlass" CACHE PATH
+    "Path to the CUTLASS source tree")
 set(CUTLASS_INCLUDE ${CUTLASS_DIR}/include)
 
 # Fail fast if CUTLASS isn't vendored — the main FP8/FP4 GEMM kernels
@@ -528,7 +567,8 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   add_library(sm120_nvfp4_ffn_obj OBJECT
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu)
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -540,6 +580,33 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     ${CUTLASS_DIR}/tools/util/include
   )
   target_compile_options(sm120_nvfp4_ffn_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+endif()
+
+# ── SM120a NVFP4 development probes ──
+# These are tuning/proof kernels, not runtime dependencies. Keep them behind an
+# explicit developer option so the public pybind module does not grow research
+# symbols by default.
+if(FLASHRT_ENABLE_SM120_DEV_KERNELS AND
+   (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121"))
+  add_library(sm120_nvfp4_dev_obj OBJECT
+    csrc/gemm/fp4/cutlass_nvfp4_w4a16_tilesweep_sm120.cu
+    csrc/gemm/fp4/normfold/cutlass_nvfp4_normfold_probe_sm120.cu)
+  set_target_properties(sm120_nvfp4_dev_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(sm120_nvfp4_dev_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(sm120_nvfp4_dev_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
       ${GPU_GENCODE}
@@ -577,13 +644,13 @@ endif()
 
 # ── Dedicated M=1 decode GEMV (FP8 + BF16) ──
 # Origin sm_120a, but neither kernel uses an SM120-specific instruction, so both
-# compile for Ada (sm89) too — built for the FP8-capable consumer RTX arches
-# (sm89 / sm120). Independent of FLASHRT_ENABLE_MOTUS: the bindings are gated by
+# compile for Thor (sm110) and Ada (sm89) too. Independent of
+# FLASHRT_ENABLE_MOTUS: the bindings are gated by
 # ENABLE_DECODE_GEMV_M1 (set alongside this object below), so the object must
 # link whenever it is built — otherwise the binding would reference an unlinked
 # symbol when MOTUS is OFF. (FP8 still needs the SM120 prefill GEMM in MOTUS, so
 # the FP8 path is SM120-only; the BF16 path runs wherever this object is built.)
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
    GPU_ARCH STREQUAL "89")
   add_library(decode_gemv_m1_obj OBJECT
     csrc/gemm/fp8_gemv_m1_sm120.cu
@@ -597,6 +664,32 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
   )
   target_compile_options(decode_gemv_m1_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+endif()
+
+# ── Qwen3 SM120 fp8 prefill attention ──
+# Shared low-level sage2 fp8 code is compiled from a neutral Qwen3 object so
+# Qwen3 does not depend on FLASHRT_ENABLE_MOTUS. Runtime remains env-gated.
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  add_library(qwen3_prefill_sm120_obj OBJECT
+    csrc/attention/sage2/sage2_attn_f8_raw.cu
+    csrc/attention/fmha_fp8_causal_gqa_sm120.cu)
+  set_target_properties(qwen3_prefill_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(qwen3_prefill_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/sage2/qattn
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/quantize
+  )
+  target_compile_options(qwen3_prefill_sm120_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
       ${GPU_GENCODE}
@@ -709,8 +802,10 @@ if(ENABLE_NVFP4)
 endif()
 
 # ── Flash-Attention 2 vendored kernels (fp16 + bf16 fwd SM80) ──
-# Built as an object library and linked into a SEPARATE pybind module
-# flash_rt_fa2.so — same isolation pattern as flash_rt_fp4.so. The
+# By default the object library is linked directly into the existing
+# flash_rt_fa2.so Python module. Native C++ builds explicitly opt into a
+# Python-free raw library; an enabled Python adapter then becomes a thin
+# consumer of that library. The
 # main flash_rt_kernels.so stays small (~3.6 MB) and its rebuild no
 # longer waits on FA2's heavy CUTLASS 3.x template codegen (~8 min).
 #
@@ -719,7 +814,8 @@ endif()
 # fa2_wrapper.cu provides the raw-pointer C entries
 # (fvk_attention_fa2_fwd_{fp16,bf16}); fa2_bindings.cpp pybind11-wraps
 # them into the flash_rt_fa2 module.
-if(ENABLE_FA2)
+if(ENABLE_FA2 AND
+   (FLASHRT_BUILD_FA2_PYTHON_ADAPTER OR FLASHRT_ENABLE_NATIVE_CPP))
   # Dynamic source list: {hdim} x {dtype} x {split, no-split} .cu files,
   # driven by FA2_HDIMS / FA2_DTYPES cache vars. Default is the full
   # 12-file matrix; users can restrict either axis to slim builds.
@@ -773,7 +869,13 @@ if(ENABLE_FA2)
       csrc/attention/fa2_causal_inst/flash_fwd_split_hdim256_bf16_sm80_causal.cu
     )
   endif()
-  if("bf16" IN_LIST FA2_DTYPES AND ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    # The native C boundary has a stable five-symbol surface. Its causal
+    # wrapper contains native-only fail-fast dispatch for a slim matrix.
+    list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
+  elseif("bf16" IN_LIST FA2_DTYPES AND
+         ("128" IN_LIST FA2_HDIMS OR "256" IN_LIST FA2_HDIMS))
+    # Preserve the existing Python-only source matrix exactly by default.
     list(APPEND FA2_SRCS csrc/attention/fa2_wrapper_causal.cu)
   endif()
 
@@ -782,6 +884,14 @@ if(ENABLE_FA2)
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
   )
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    target_compile_definitions(fa2_vendor_obj PRIVATE
+      FLASHRT_FA2_NATIVE_BUILD=1)
+    set_target_properties(fa2_vendor_obj PROPERTIES
+      CXX_VISIBILITY_PRESET hidden
+      CUDA_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN YES)
+  endif()
   target_include_directories(fa2_vendor_obj PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/flash_attn_2_src
@@ -896,20 +1006,67 @@ if(ENABLE_FA2)
   math(EXPR _FA2_NKERN "${_FA2_NSRC} - 1")
   message(STATUS "FA2 vendor instantiations: hdim={${_FA2_H}} x dtype={${_FA2_D}} x {split,no-split} = ${_FA2_NKERN} kernel .cu files")
 
-  # Independent pybind module. Caller side:
-  #     from flash_rt import flash_rt_fa2 as fa2
-  #     fa2.fwd_fp16(...)  /  fa2.fwd_bf16(...)
-  pybind11_add_module(flash_rt_fa2 csrc/fa2_bindings.cpp)
-  set_target_properties(flash_rt_fa2 PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
-    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
-  target_sources(flash_rt_fa2 PRIVATE $<TARGET_OBJECTS:fa2_vendor_obj>)
-  target_include_directories(flash_rt_fa2 PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
-  )
-  target_link_libraries(flash_rt_fa2 PRIVATE CUDA::cudart)
-  install(TARGETS flash_rt_fa2 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
-  message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
+  if(FLASHRT_ENABLE_NATIVE_CPP)
+    # Opt-in Python-free linkage boundary for native C++ runtimes.
+    add_library(flashrt_fa2_raw SHARED)
+    target_sources(flashrt_fa2_raw PRIVATE
+      $<TARGET_OBJECTS:fa2_vendor_obj>)
+    target_link_libraries(flashrt_fa2_raw PRIVATE CUDA::cudart)
+    if(MSVC)
+      target_compile_definitions(flashrt_fa2_raw PRIVATE
+        FLASHRT_FA2_NATIVE_BUILD=1)
+    else()
+      target_link_options(flashrt_fa2_raw PRIVATE
+        "LINKER:--no-undefined")
+      if(UNIX AND NOT APPLE)
+        target_link_options(flashrt_fa2_raw PRIVATE
+          "LINKER:--version-script=${CMAKE_CURRENT_SOURCE_DIR}/csrc/attention/fa2_native_exports.map")
+      endif()
+    endif()
+    set_target_properties(flashrt_fa2_raw PROPERTIES
+      CXX_VISIBILITY_PRESET hidden
+      CUDA_VISIBILITY_PRESET hidden
+      VISIBILITY_INLINES_HIDDEN YES
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+      BUILD_RPATH "$ORIGIN"
+      INSTALL_RPATH "$ORIGIN"
+      BUILD_WITH_INSTALL_RPATH ON)
+    install(TARGETS flashrt_fa2_raw
+      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+    message(STATUS "FA2 native C library: flashrt_fa2_raw (opt-in)")
+  endif()
+
+  if(FLASHRT_BUILD_FA2_PYTHON_ADAPTER)
+    # Independent pybind module. Caller side:
+    #     from flash_rt import flash_rt_fa2 as fa2
+    #     fa2.fwd_fp16(...)  /  fa2.fwd_bf16(...)
+    pybind11_add_module(flash_rt_fa2 csrc/fa2_bindings.cpp)
+    set_target_properties(flash_rt_fa2 PROPERTIES
+      LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+      RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+    target_include_directories(flash_rt_fa2 PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    )
+    if(FLASHRT_ENABLE_NATIVE_CPP)
+      target_compile_definitions(flash_rt_fa2 PRIVATE
+        FLASHRT_FA2_NATIVE_SHARED=1)
+      target_link_libraries(flash_rt_fa2 PRIVATE
+        flashrt_fa2_raw CUDA::cudart)
+      set_target_properties(flash_rt_fa2 PROPERTIES
+        BUILD_RPATH "$ORIGIN"
+        INSTALL_RPATH "$ORIGIN"
+        BUILD_WITH_INSTALL_RPATH ON)
+    else()
+      # This is the compatibility path and must remain the default.
+      target_sources(flash_rt_fa2 PRIVATE
+        $<TARGET_OBJECTS:fa2_vendor_obj>)
+      target_link_libraries(flash_rt_fa2 PRIVATE CUDA::cudart)
+    endif()
+    install(TARGETS flash_rt_fa2
+      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+    message(STATUS "FA2 pybind module: flash_rt_fa2 (separate .so)")
+  endif()
 endif()
 
 # ── Qwen3-VL kernels (separate module, additive) ──
@@ -967,36 +1124,110 @@ else()
   message(STATUS "OmniVoice TTS SM120 kernels: DISABLED")
 endif()
 
+# ── MiniMax-Remover fused kernels (standalone module, independent
+#    of flash_rt_kernels) ──
+# Builds flash_rt_minimax_remover.so with MiniMax-specific FP8/NVFP4
+# transformer kernels plus fused VAE helpers. The module is opt-in and
+# remains separate from the default flash_rt_kernels target.
+# Enable explicitly on a Blackwell (sm_120) build:
+#   cmake -DFLASHRT_ENABLE_MINIMAX_REMOVER=ON -DGPU_ARCH=120 ...
+if(FLASHRT_ENABLE_MINIMAX_REMOVER)
+  pybind11_add_module(flash_rt_minimax_remover
+    csrc/minimax_remover_extra_bindings.cpp
+    csrc/kernels/minimax_remover/fp16_rms_norm_ncdhw.cu
+    csrc/kernels/minimax_remover/fp16_rms_silu_ncdhw.cu
+    csrc/kernels/minimax_remover/fp16_rms_norm_ndhwc.cu
+    csrc/kernels/minimax_remover/fp8_conv3d_mm_ndhwc_fp16out.cu
+  csrc/kernels/minimax_remover/fp16_quant_fp8_per_tensor.cu
+  csrc/kernels/minimax_remover/fp16_rms_silu_fp8_ndhwc.cu
+  csrc/kernels/minimax_remover/fp16_bias_gelu_quant_fp8.cu
+  csrc/kernels/minimax_remover/fp16_bias_gate_residual.cu
+  csrc/kernels/minimax_remover/fp16_ada_layernorm_quant_fp8.cu
+  csrc/kernels/minimax_remover/fp16_rmsnorm_rope.cu
+  csrc/kernels/minimax_remover/fp16_rmsnorm_rope_quant_int8.cu
+  csrc/kernels/minimax_remover/fp16_quant_nvfp4_ndhwc.cu
+  csrc/kernels/minimax_remover/nvfp4_conv3d_ndhwc_fp16out.cu)
+  set_target_properties(flash_rt_minimax_remover PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_minimax_remover PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_minimax_remover PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3 --use_fast_math
+      -U__CUDA_NO_HALF_OPERATORS__
+      -U__CUDA_NO_HALF2_OPERATORS__
+      -U__CUDA_NO_HALF_CONVERSIONS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_minimax_remover PRIVATE CUDA::cudart CUDA::cublas CUDA::cublasLt)
+  install(TARGETS flash_rt_minimax_remover LIBRARY DESTINATION flash_rt)
+  message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: ENABLED")
+else()
+  message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: DISABLED")
+endif()
+
 if(FLASHRT_BUILD_QWEN3_VL)
   # SM120 (RTX 5090): NVFP4/FP8 ViT helpers. SM89 (Ada): native FP8 block-128
   # GEMM/GEMV + fused act/norm-quant + QK norm-rope kernels for the official
-  # FP8 Qwen3-VL path. Both build into the same separate module so neither
-  # bloats the central flash_rt_kernels.so.
-  if(NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89"))
+  # FP8 Qwen3-VL path. SM87 (Jetson Orin): BF16 ViT helper module only; the
+  # language path reuses the generic flash_rt_kernels BF16 Qwen3 helpers.
+  # All build into a separate module so neither bloats flash_rt_kernels.so.
+  if(NOT (GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89" OR
+          GPU_ARCH STREQUAL "87"))
     message(FATAL_ERROR
       "FLASHRT_BUILD_QWEN3_VL requires GPU_ARCH=120 (RTX 5090 / sm_120) or "
-      "GPU_ARCH=89 (Ada / sm_89); got '${GPU_ARCH}'.")
+      "GPU_ARCH=89 (Ada / sm_89) or GPU_ARCH=87 (Jetson Orin / sm_87); "
+      "got '${GPU_ARCH}'.")
   endif()
+
   set(QWEN3_VL_SOURCES
     csrc/qwen3_vl_bindings.cpp
     csrc/kernels/rope_neox_qk_bf16.cu
-    csrc/kernels/norm_act_to_fp8_block128.cu
     csrc/kernels/bias_epilogue_bf16.cu)
-  if(GPU_ARCH STREQUAL "89")
+
+  if(GPU_ARCH STREQUAL "120")
+    list(APPEND QWEN3_VL_SOURCES
+      csrc/kernels/norm_act_to_fp8_block128.cu)
+  elseif(GPU_ARCH STREQUAL "89")
     # Ada has no TMA / no warp-specialized CUTLASS collective, so these are
     # hand-written cp.async + ldmatrix + block-128 scaling kernels (see
     # docs/qwen3_vl_fp8_sm89.md for why the SM120a CUTLASS path does not port).
     list(APPEND QWEN3_VL_SOURCES
+      csrc/kernels/norm_act_to_fp8_block128.cu
       csrc/gemm/fp8_block128_gemm_mma_sm89.cu
       csrc/gemm/fp8_gemv_m1_sm89.cu
       csrc/quantize/fp8_per_token_block_quant.cu
       csrc/kernels/qwen3_qkv_post_proc.cu
       csrc/kernels/bf16_matmul_bf16.cu)
+  elseif(GPU_ARCH STREQUAL "87")
+    list(APPEND QWEN3_VL_SOURCES
+      csrc/kernels/bf16_matmul_bf16.cu
+      csrc/kernels/qwen3_vl_bf16_gemv_m1.cu)
   endif()
+
   pybind11_add_module(flash_rt_qwen3_vl_kernels ${QWEN3_VL_SOURCES})
+  if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "89")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_FP8_ACT=1)
+  endif()
+  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_BF16_CUBLASLT=1)
+  endif()
+  if(GPU_ARCH STREQUAL "87")
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_BF16_GEMV_M1=1)
+  endif()
   if(GPU_ARCH STREQUAL "89")
     target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
       ENABLE_SM89_BLOCK_FP8_GEMM=1)
+  endif()
+  if(FLASHRT_ENABLE_QWEN3_VL_DEV_KERNELS)
+    target_compile_definitions(flash_rt_qwen3_vl_kernels PRIVATE
+      ENABLE_QWEN3_VL_DEV_KERNELS=1)
   endif()
   set_target_properties(flash_rt_qwen3_vl_kernels PROPERTIES
     CUDA_STANDARD 17
@@ -1013,8 +1244,8 @@ if(FLASHRT_BUILD_QWEN3_VL)
       ${GPU_GENCODE}
     >)
   target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cudart)
-  if(GPU_ARCH STREQUAL "89")
-    # bf16_matmul_bf16 (ViT bf16 linears on SM89) uses cuBLASLt.
+  if(GPU_ARCH STREQUAL "87" OR GPU_ARCH STREQUAL "89")
+    # bf16_matmul_bf16 (ViT/language bf16 linears) uses cuBLASLt.
     target_link_libraries(flash_rt_qwen3_vl_kernels PRIVATE CUDA::cublasLt)
   endif()
   install(TARGETS flash_rt_qwen3_vl_kernels
@@ -1120,6 +1351,33 @@ set_target_properties(flash_rt_kernels PROPERTIES
   LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
   RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 
+if(FLASHRT_ENABLE_COSMOS3_EDGE)
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/cosmos3_edge_misc.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  message(STATUS "Cosmos3-Edge AV kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Cosmos3-Edge AV kernels: DISABLED")
+endif()
+
+if(FLASHRT_ENABLE_COSMOS3_REASONER)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/cosmos3_reasoner_attn.cu
+    csrc/kernels/cosmos3_reasoner_gemv.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_COSMOS3_REASONER=1)
+  message(STATUS "Cosmos3 Reasoner kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Cosmos3 Reasoner kernels: DISABLED")
+endif()
+
+if(FLASHRT_ENABLE_AUDIO_CODEBOOK)
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/kernels/delayed_codebook_kernels.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_AUDIO_CODEBOOK=1)
+  message(STATUS "Delayed audio-codebook kernels: ENABLED")
+else()
+  message(STATUS "Delayed audio-codebook kernels: DISABLED")
+endif()
+
 # ── Motus VAE FP8 quantize kernels (slim-gated) ──
 # These 5 TUs are used only by the Motus VAE FP8 path (the *_ncdhw* /
 # upsample / per-tensor AWQ-FP8 quant helpers; see flash_rt/models/motus/*).
@@ -1217,7 +1475,8 @@ if(NOT FLASHRT_SLIM_BUILD OR ENABLE_NVFP4)
   target_sources(flash_rt_kernels PRIVATE
     csrc/quantize/fp8_block128_to_nvfp4_swizzled.cu
     csrc/quantize/bf16_weight_to_nvfp4_swizzled.cu
-    csrc/kernels/silu_mul_to_nvfp4_swizzled.cu)
+    csrc/kernels/silu_mul_to_nvfp4_swizzled.cu
+    csrc/kernels/fp4_swiglu_compact_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_NVFP4_SWIZZLE=1)
   message(STATUS "NVFP4 swizzle/quantize kernels: ENABLED")
 else()
@@ -1300,14 +1559,22 @@ if(GPU_ARCH STREQUAL "120")
 endif()
 
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
-# object is built (sm89 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
+# object is built (sm89 / sm110 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
 # resolve, independent of FLASHRT_ENABLE_MOTUS.
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
+if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
    GPU_ARCH STREQUAL "89")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:decode_gemv_m1_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_DECODE_GEMV_M1=1)
+endif()
+
+if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:qwen3_prefill_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_SAGE2_F8_RAW=1
+    ENABLE_QWEN3_FP8_PREFILL_ATTN=1)
 endif()
 
 # SM120a CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt path).
@@ -1318,6 +1585,12 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
     ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
+  if(FLASHRT_ENABLE_SM120_DEV_KERNELS)
+    target_sources(flash_rt_kernels PRIVATE
+      $<TARGET_OBJECTS:sm120_nvfp4_dev_obj>)
+    target_compile_definitions(flash_rt_kernels PRIVATE
+      FLASHRT_HAVE_SM120_NVFP4_DEV=1)
+  endif()
 endif()
 
 # SM100 CUTLASS NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt on Thor).
@@ -1340,6 +1613,17 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121" OR
     ENABLE_QWEN36_FLASHINFER_XQA=1)
 endif()
 
+if(GPU_ARCH STREQUAL "110")
+  target_sources(flash_rt_kernels PRIVATE
+    csrc/conv/fp8_conv3d_sm120_v17.cu
+    csrc/conv/fp8_conv3d_sm120_v18.cu
+    csrc/conv/bf16_conv3d_v0_sm110.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    ENABLE_FP8_CONV3D_V17=1
+    ENABLE_FP8_CONV3D_V18=1
+    ENABLE_BF16_CONV3D_V0=1)
+endif()
+
 if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:motus_aux_sm120_obj>
@@ -1356,8 +1640,9 @@ if(FLASHRT_ENABLE_MOTUS AND GPU_ARCH STREQUAL "120")
     ENABLE_TINYFP8_KERNELS=1)
 endif()
 
-# (ENABLE_FA2 object-lib is linked into flash_rt_fa2.so only — see
-# the dedicated pybind11_add_module(flash_rt_fa2 ...) above. The main
+# (ENABLE_FA2 object-lib is linked directly into flash_rt_fa2.so by default.
+# Native C++ builds opt into libflashrt_fa2_raw.so and may link the adapter
+# against that single implementation. The main
 # flash_rt_kernels.so deliberately does NOT pull FA2 in, so rebuilds
 # of our hand-written kernels don't re-trigger the FA2 codegen tax.)
 
@@ -1413,6 +1698,12 @@ if(ENABLE_SM100_CUTLASS)
     csrc/fused_fp4/silu_mul_two_fp4_to_fp4.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_fp4out.cu
   )
+  if(FLASHRT_ENABLE_COSMOS3_EDGE)
+    target_sources(fp4_kernels_obj PRIVATE
+      csrc/fused_fp4/cosmos3_edge_fp4.cu
+      csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu)
+    target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
   set_target_properties(fp4_kernels_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -1444,6 +1735,9 @@ if(ENABLE_SM100_CUTLASS)
   target_include_directories(flash_rt_fp4 PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/csrc
   )
+  if(FLASHRT_ENABLE_COSMOS3_EDGE)
+    target_compile_definitions(flash_rt_fp4 PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
   target_link_libraries(flash_rt_fp4 PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 endif()
