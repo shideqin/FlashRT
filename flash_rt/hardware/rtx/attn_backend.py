@@ -214,7 +214,8 @@ class RtxFlashAttnBackend:
     """
 
     def __init__(self, num_views: int, encoder_seq_max: int, chunk_size: int,
-                 num_encoder_layers: int = 18, dtype=None):
+                 num_encoder_layers: int = 18, dtype=None,
+                 encoder_splitkv: bool = True):
         import torch
         import os
         self._torch = torch
@@ -380,11 +381,17 @@ class RtxFlashAttnBackend:
             self._vis_o_accum = torch.empty(_sig_splits, num_views, 16, 256, 96,
                                             dtype=torch.float32, device=d)
             # Encoder: D=256 → block_n=64, Sk=encoder_seq_max → n_blocks = ceil(S/64).
-            _enc_splits = min(128, (encoder_seq_max + 63) // 64)
-            self._enc_lse_accum = torch.empty(_enc_splits, 1, 8, encoder_seq_max,
-                                              dtype=torch.float32, device=d)
-            self._enc_o_accum = torch.empty(_enc_splits, 1, 8, encoder_seq_max, 256,
-                                            dtype=torch.float32, device=d)
+            # encoder_splitkv=False runs the prefix attention unsplit (on
+            # SM120 the split + combine pair is slower at prefix lengths).
+            if encoder_splitkv:
+                _enc_splits = min(128, (encoder_seq_max + 63) // 64)
+                self._enc_lse_accum = torch.empty(_enc_splits, 1, 8, encoder_seq_max,
+                                                  dtype=torch.float32, device=d)
+                self._enc_o_accum = torch.empty(_enc_splits, 1, 8, encoder_seq_max, 256,
+                                                dtype=torch.float32, device=d)
+            else:
+                self._enc_lse_accum = None
+                self._enc_o_accum = None
             # Decoder: D=256, Sk up to encoder_seq_max + chunk_size.
             _dec_splits = min(128, (total_kv + 63) // 64)
             self._dec_lse_accum = torch.empty(_dec_splits, 1, 8, chunk_size,
@@ -424,6 +431,7 @@ class RtxFlashAttnBackend:
             "enc_K": self.enc_K.data_ptr(),
             "enc_V": self.enc_V.data_ptr(),
             "dec_Q": self.dec_Q.data_ptr(),
+            "dec_O": self._dec_O.data_ptr() if getattr(self, "_dec_O", None) is not None else 0,
             "enc_k_layer_stride_bytes": self._enc_kv_layer_stride_bytes,
             "enc_v_layer_stride_bytes": self._enc_kv_layer_stride_bytes,
         }

@@ -183,6 +183,13 @@ option(FLASHRT_ENABLE_COSMOS3_EDGE
        "Build Cosmos3-Edge AV kernels and bindings for Jetson AGX Thor" OFF)
 option(FLASHRT_ENABLE_COSMOS3_REASONER
        "Build Cosmos3 Reasoner kernels and bindings for Jetson AGX Thor" OFF)
+option(FLASHRT_ENABLE_ALPAMAYO15
+       "Build Alpamayo 1.5 kernels and bindings for Jetson AGX Thor" OFF)
+if(FLASHRT_ENABLE_ALPAMAYO15 AND NOT GPU_ARCH STREQUAL "110")
+  message(FATAL_ERROR
+    "Alpamayo 1.5 kernels require GPU_ARCH=110; current GPU_ARCH=${GPU_ARCH}. "
+    "Disable FLASHRT_ENABLE_ALPAMAYO15 for non-Thor builds.")
+endif()
 if((FLASHRT_ENABLE_COSMOS3_EDGE OR FLASHRT_ENABLE_COSMOS3_REASONER) AND
    NOT GPU_ARCH STREQUAL "110")
   message(FATAL_ERROR
@@ -264,6 +271,13 @@ option(FLASHRT_ENABLE_MELBAND_ROFORMER
 # Enable explicitly on a Blackwell (sm_120) build.
 option(FLASHRT_ENABLE_OMNIVOICE
        "Build OmniVoice TTS RTX SM120 fused kernels in flash_rt_omnivoice" OFF)
+# DM05 (LIBERO VLA) — builds flash_rt_dm05.so with the kernels FlashRT has no
+# equivalent for: SigLIP self-attention at head_dim 72, and the head_dim-256
+# grouped-query decode attention of the action expert. Opt-in, and separate
+# from the default flash_rt_kernels target. Enable on a Blackwell (sm_120)
+# build with -DFLASHRT_ENABLE_DM05=ON.
+option(FLASHRT_ENABLE_DM05
+       "Build DM05 RTX SM120 fused kernels in flash_rt_dm05" OFF)
 # Shared delayed-codebook helper used by discrete-audio paths. Kept behind an
 # explicit option so deployment builds that do not serve audio can remove the
 # TU and its binding in lockstep.
@@ -632,7 +646,8 @@ endif()
 # 'a' arch-accelerated suffix that enables F8F6F4 MMA + TMA SM120).
 if(GPU_ARCH STREQUAL "120")
   add_library(cutlass_sm120_block_obj OBJECT
-    csrc/gemm/cutlass_sm120_block128_fp8_gemm.cu)
+    csrc/gemm/cutlass_sm120_block128_fp8_gemm.cu
+    csrc/gemm/cutlass_sm120_block128_fp8_gemm_bias_sm120.cu)
   set_target_properties(cutlass_sm120_block_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -658,6 +673,7 @@ if(GPU_ARCH STREQUAL "120")
   add_library(sm120_fp8_smallm_obj OBJECT
     csrc/gemm/fp8_smallM_handtuned_sm120.cu
     csrc/gemm/fp8_smallM_handtuned_splitk_sm120.cu
+    csrc/gemm/fp8_smallM_splitk_block128_sm120.cu
     csrc/gemm/fp8_smallM_handtuned_ldmatrix_sm120.cu)
   set_target_properties(sm120_fp8_smallm_obj PROPERTIES
     CUDA_STANDARD 17
@@ -673,6 +689,36 @@ if(GPU_ARCH STREQUAL "120")
       ${GPU_GENCODE}
     >
   )
+endif()
+
+# ── Skinny FP8 decoder GEMM family (sm_120a mma.kind::f8f6f4 + PDL) ──
+# Small-row action-decoder GEMMs with K split across CTAs and fused consumers.
+option(FLASHRT_ENABLE_PI05_SKINNY "Build experimental Pi0.5 SM120 decoder kernels" OFF)
+option(FLASHRT_ENABLE_PI05_SDE "Build Pi0.5 stochastic denoising kernels" OFF)
+option(FLASHRT_ENABLE_PI05_NVFP4 "Build Pi0.5 NVFP4 prefix kernels" OFF)
+if((FLASHRT_ENABLE_PI05_SKINNY OR FLASHRT_ENABLE_PI05_NVFP4) AND NOT GPU_ARCH STREQUAL "120")
+  message(FATAL_ERROR "Pi0.5 skinny/NVFP4 kernels require GPU_ARCH=120")
+endif()
+if(FLASHRT_ENABLE_PI05_SKINNY)
+  message(STATUS "Pi0.5 skinny decoder kernels: ENABLED (SM120, runtime opt-in)")
+  add_library(pi05_decoder_skinny_sm120_obj OBJECT
+    csrc/kernels/pi05/pi05_decoder_skinny_fp8_sm120.cu)
+  set_target_properties(pi05_decoder_skinny_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(pi05_decoder_skinny_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+  )
+  target_compile_options(pi05_decoder_skinny_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      ${GPU_GENCODE}
+    >
+  )
+else()
+  message(STATUS "Pi0.5 skinny decoder kernels: DISABLED")
 endif()
 
 # ── CUTLASS SM120a NVFP4 W4A16 GEMM (Qwen3.6 NVFP4 ckpt) ──
@@ -709,7 +755,9 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_bf16out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_gelu_fp4out_sm120.cu
     csrc/gemm/fp4/cutlass_nvfp4_gemm_dn_streamk_bias_sm120.cu
-    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu)
+    csrc/gemm/fp4/cutlass_nvfp4_dual_gemm_silu_fp4out_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_bias_res_sm120.cu
+    csrc/gemm/fp4/cutlass_nvfp4_gemm_glu_fp4out_sm120.cu)
   set_target_properties(sm120_nvfp4_ffn_obj PROPERTIES
     CUDA_STANDARD 17
     POSITION_INDEPENDENT_CODE ON
@@ -723,6 +771,30 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_compile_options(sm120_nvfp4_ffn_obj PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
       --expt-relaxed-constexpr -O3 --use_fast_math
+      ${GPU_GENCODE}
+    >
+  )
+  # Skinny NVFP4 (W4A4) GEMM family + fused block consumers (mma.kind::mxf4nvf4,
+  # small-row weight-streaming shapes: action decoders and DiT heads).
+  add_library(nvfp4_skinny_sm120_obj OBJECT
+    csrc/gemm/fp4/nvfp4_skinny_gemm_sm120.cu
+    csrc/gemm/fp4/nvfp4_skinny_consumers_sm120.cu
+    csrc/gemm/fp4/nvfp4_skinny_attention_sm120.cu
+    csrc/kernels/nvfp4_prefill_sm120.cu
+    csrc/kernels/fp8_prefill_fp16.cu
+    csrc/kernels/fused_qkv_attention.cu)
+  set_target_properties(nvfp4_skinny_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(nvfp4_skinny_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+  )
+  target_compile_options(nvfp4_skinny_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
       ${GPU_GENCODE}
     >
   )
@@ -847,7 +919,13 @@ endif()
 # ── Qwen3 SM120 fp8 prefill attention ──
 # Shared low-level sage2 fp8 code is compiled from a neutral Qwen3 object so
 # Qwen3 does not depend on FLASHRT_ENABLE_MOTUS. Runtime remains env-gated.
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+# Its fmha entry statically allocates >48 KB of shared memory, which CUDA 13
+# accepts and older toolkits do not; the option lets a build that targets a
+# different model (Spark-X2.5, Qwen3.6) drop the group along with its bindings.
+option(FLASHRT_ENABLE_QWEN3_FP8_PREFILL
+       "Build Qwen3 SM120 FP8 prefill attention (sage2 + fmha)" ON)
+if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+   AND FLASHRT_ENABLE_QWEN3_FP8_PREFILL)
   add_library(qwen3_prefill_sm120_obj OBJECT
     csrc/attention/sage2/sage2_attn_f8_raw.cu
     csrc/attention/fmha_fp8_causal_gqa_sm120.cu)
@@ -1023,6 +1101,17 @@ if(ENABLE_FA2 AND
   endforeach()
   list(REMOVE_DUPLICATES FA2_BUILT_HDIMS)
   list(REMOVE_DUPLICATES FA2_BUILT_DTYPES)
+  # Short-query FA2 tile (bf16, head_dim <= 128) for models with a short
+  # seqlen_q. Additive: a separate TU with its own traits, so the upstream
+  # dispatch is untouched.
+  set(FA2_HAS_SMALLQ_BF16 OFF)
+  if("bf16" IN_LIST FA2_DTYPES AND
+     ("96" IN_LIST FA2_HDIMS OR "128" IN_LIST FA2_HDIMS))
+    set(FA2_HAS_SMALLQ_BF16 ON)
+    list(APPEND FA2_SRCS
+      csrc/attention/fa2_tile_inst/flash_fwd_smallq_bf16_sm80.cu
+    )
+  endif()
   # Always include the wrapper — it ifdef-guards its entries based on
   # which hdim/dtype instantiations were built, so it links cleanly
   # against any subset of the matrix.
@@ -1191,6 +1280,9 @@ if(ENABLE_FA2 AND
   # head_dim <= 128 branch stubs out at compile time so no
   # run_mha_fwd_<..., 128, ...> symbol is referenced from wrapper.cu
   # (which would otherwise break linking).
+  if(FA2_HAS_SMALLQ_BF16)
+    target_compile_definitions(fa2_vendor_obj PRIVATE FA2_HAS_SMALLQ_BF16=1)
+  endif()
   foreach(_hd IN LISTS FA2_BUILT_HDIMS)
     target_compile_definitions(fa2_vendor_obj PRIVATE FA2_HAS_HDIM_${_hd}=1)
   endforeach()
@@ -1331,6 +1423,44 @@ else()
   message(STATUS "OmniVoice TTS SM120 kernels: DISABLED")
 endif()
 
+# ── DM05 fused kernels (standalone module, independent of flash_rt_kernels) ──
+if(FLASHRT_ENABLE_DM05)
+  if(NOT GPU_ARCH STREQUAL "120")
+    message(FATAL_ERROR
+      "FLASHRT_ENABLE_DM05 requires GPU_ARCH=120 (Blackwell / sm_120); "
+      "got '${GPU_ARCH}'.")
+  endif()
+  pybind11_add_module(flash_rt_dm05
+    csrc/dm05_extra_bindings.cpp
+    csrc/kernels/dm05/dm05_ae_decode_attn.cu
+    csrc/kernels/dm05/dm05_prefix_attn.cu
+    csrc/kernels/dm05/dm05_w8a16.cu
+    csrc/kernels/dm05/dm05_vit_attn_hd72.cu)
+  set_target_properties(flash_rt_dm05 PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_dm05 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  # --use_fast_math is deliberately absent. These kernels reproduce a specific
+  # set of roundings, and the places where the reference rounds through a
+  # fast-math instruction spell it out themselves (dm05_common.cuh); leaving
+  # the flag off keeps every other expression IEEE.
+  target_compile_options(flash_rt_dm05 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_BFLOAT16_OPERATORS__
+      -U__CUDA_NO_BFLOAT162_OPERATORS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_dm05 PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_dm05 LIBRARY DESTINATION flash_rt)
+  message(STATUS "DM05 SM120 kernels: ENABLED")
+else()
+  message(STATUS "DM05 SM120 kernels: DISABLED")
+endif()
+
 # ── MiniMax-Remover fused kernels (standalone module, independent
 #    of flash_rt_kernels) ──
 # Builds flash_rt_minimax_remover.so with MiniMax-specific FP8/NVFP4
@@ -1374,6 +1504,51 @@ if(FLASHRT_ENABLE_MINIMAX_REMOVER)
   message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: ENABLED")
 else()
   message(STATUS "MiniMax-Remover FP8/NVFP4 kernels: DISABLED")
+endif()
+
+# ── Spark-X2.5-4B (SM120) ────────────────────────────────────────────────
+#
+# The decode path for Spark-X2.5-4B: a two-pass attention over an E4M3 KV
+# cache, the KV writer (partial RoPE + E4M3 quantisation in one pass), the
+# boundary norm/quantiser, the per-head output gate, gproj, the device-side
+# position advance and the greedy argmax.
+#
+# A separate module rather than sources in flash_rt_kernels: this pipeline is
+# trained, validated and shipped as a unit (see docs/spark_x25_usage.md), so a
+# change here must not re-trigger the shared kernel build. Same reason the
+# MiniMax-Remover and Qwen3-VL modules are separate.
+#
+# sm_120 only: the KV cache is quantised to E4M3 with __nv_cvt_float_to_fp8 and
+# the softmax/score kernels assume the RTX shared-memory budget the tile sizes
+# were chosen against. The frontend refuses to resolve on any other arch.
+option(FLASHRT_ENABLE_SPARK_X25 "Build Spark-X2.5 SM120 model kernels" OFF)
+if(FLASHRT_ENABLE_SPARK_X25 AND NOT GPU_ARCH STREQUAL "120")
+  message(FATAL_ERROR "FLASHRT_ENABLE_SPARK_X25 requires GPU_ARCH=120")
+endif()
+if(FLASHRT_ENABLE_SPARK_X25)
+  pybind11_add_module(flash_rt_sparkx25
+    csrc/spark_x25_bindings.cpp
+    csrc/kernels/spark_x25/spark_x25_kernels.cu)
+  set_target_properties(flash_rt_sparkx25 PROPERTIES
+    CUDA_STANDARD 17
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
+  target_include_directories(flash_rt_sparkx25 PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels)
+  target_compile_options(flash_rt_sparkx25 PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      -U__CUDA_NO_HALF_OPERATORS__
+      -U__CUDA_NO_HALF2_OPERATORS__
+      -U__CUDA_NO_HALF_CONVERSIONS__
+      ${GPU_GENCODE}
+    >)
+  target_link_libraries(flash_rt_sparkx25 PRIVATE CUDA::cudart)
+  install(TARGETS flash_rt_sparkx25 LIBRARY DESTINATION flash_rt)
+  message(STATUS "Spark-X2.5-4B kernels: ENABLED (separate module flash_rt_sparkx25)")
+else()
+  message(STATUS "Spark-X2.5-4B kernels: DISABLED (set FLASHRT_ENABLE_SPARK_X25=ON on sm_120)")
 endif()
 
 if(FLASHRT_BUILD_QWEN3_VL)
@@ -1553,6 +1728,10 @@ endif()
 pybind11_add_module(flash_rt_kernels
   csrc/gemm/gemm_runner.cu
   csrc/kernels/norm.cu
+  csrc/kernels/linear_f32.cu
+  csrc/kernels/resize_norm.cu
+  csrc/kernels/gelu_mul.cu
+  csrc/quantize/gelu_mul_quant_nvfp4_swizzled.cu
   csrc/kernels/activation.cu
   csrc/kernels/rope.cu
   csrc/kernels/quantize.cu
@@ -1578,6 +1757,7 @@ pybind11_add_module(flash_rt_kernels
   csrc/quantize/rope_apply_bf16.cu
   csrc/gemm/fp8_block128_gemm.cu
   csrc/kernels/silu_mul_qwen36.cu
+  csrc/kernels/act_bf16.cu
   csrc/kernels/embedding_lookup_bf16.cu
   # qwen3_5_moe-family RTX SM120 kernels are NOT listed here -- they are
   # gated into the module below (FLASHRT_ENABLE_QWEN35MOE), so SM89/87/110
@@ -1606,7 +1786,8 @@ if(ENABLE_SM100_CUTLASS)
     csrc/kernels/attention_mha_masked.cu
     csrc/kernels/vec_fp16_backbone.cu
     csrc/kernels/attention_seqused_fused.cu
-    csrc/kernels/rope_vec.cu)
+    csrc/kernels/rope_vec.cu
+    csrc/kernels/qk_norm_rope_rotate_half_bf16.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_THOR_VLA_KERNELS=1)
   message(STATUS "Thor VLA helper kernels: ENABLED (sm_${GPU_ARCH})")
 else()
@@ -1629,6 +1810,49 @@ if(FLASHRT_ENABLE_COSMOS3_REASONER)
   message(STATUS "Cosmos3 Reasoner kernels: ENABLED (sm_110)")
 else()
   message(STATUS "Cosmos3 Reasoner kernels: DISABLED")
+endif()
+
+if(FLASHRT_ENABLE_ALPAMAYO15)
+  # FlashDrive W4A8 prefill GEMM (CUTLASS sm100 groupwise INT8, tcgen05). No fast-math: the
+  # epilogue reproduces Marlin's int32 -> float -> * scale -> half rounding exactly.
+  add_library(alpamayo15_fd_w4a8_obj OBJECT csrc/gemm/alpamayo15_flashdrive_w4a8_sm100.cu)
+  set_target_properties(alpamayo15_fd_w4a8_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(alpamayo15_fd_w4a8_obj PRIVATE
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(alpamayo15_fd_w4a8_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
+  )
+  # the GEMMs honour programmatic dependent launch (they wait for the previous kernel before reading their operands)
+  target_compile_definitions(alpamayo15_fd_w4a8_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
+  # BF16 GEMMs (vision tower, action expert) on tcgen05 with fused bias / GELU / residual epilogues.
+  add_library(alpamayo15_bf16_gemm_obj OBJECT csrc/gemm/alpamayo15_bf16_gemm_sm100.cu)
+  set_target_properties(alpamayo15_bf16_gemm_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(alpamayo15_bf16_gemm_obj PRIVATE
+    ${CUTLASS_INCLUDE}
+    ${CUTLASS_DIR}/tools/util/include
+  )
+  target_compile_options(alpamayo15_bf16_gemm_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 ${GPU_GENCODE}>
+  )
+  target_compile_definitions(alpamayo15_bf16_gemm_obj PRIVATE CUTLASS_ENABLE_GDC_FOR_SM100=1)
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/alpamayo15_kernels.cu
+                                         csrc/kernels/alpamayo15_request_kernels.cu
+                                         csrc/gemm/alpamayo15_cublaslt.cu
+                                         csrc/kernels/alpamayo15_flashdrive_kernels.cu
+                                         $<TARGET_OBJECTS:alpamayo15_fd_w4a8_obj>
+                                         $<TARGET_OBJECTS:alpamayo15_bf16_gemm_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
+  message(STATUS "Alpamayo 1.5 kernels: ENABLED (sm_110)")
+else()
+  message(STATUS "Alpamayo 1.5 kernels: DISABLED")
 endif()
 
 if(FLASHRT_ENABLE_AUDIO_CODEBOOK)
@@ -1722,7 +1946,8 @@ if(NOT FLASHRT_SLIM_BUILD OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
     csrc/kernels/fp4_w4a4_matvec_sm120.cu
     csrc/kernels/fp4_w4a4_mma_sm120.cu
     csrc/kernels/fp4_w4a4_mma_warpsplit_sm120.cu
-    csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu)
+    csrc/kernels/fp4_w4a4_mma_warpsplit_mrows_sm120.cu
+    csrc/kernels/fp4_w4a4_mma_cksplit_sm120.cu)
   message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: ENABLED")
 else()
   message(STATUS "SM120 NVFP4 W4A16 fp4_w4a4 kernels: SKIPPED (slim build)")
@@ -1893,6 +2118,53 @@ if(GPU_ARCH STREQUAL "120")
     ENABLE_CUTLASS_SM120_BLOCK_FP8=1)
 endif()
 
+# Skinny FP8 decoder GEMM family: sm_120a only (mma.kind::f8f6f4).
+if(FLASHRT_ENABLE_PI05_NVFP4)
+  message(STATUS "Pi0.5 NVFP4 prefix kernels: ENABLED (SM120, runtime opt-in)")
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/pi05/pi05_geglu_nvfp4_quant.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_PI05_NVFP4=1)
+  # Skinny NVFP4 (W4A4) decoder family: sm_120a only (mma.kind::mxf4nvf4).
+  add_library(pi05_decoder_skinny_fp4_sm120_obj OBJECT
+    csrc/kernels/pi05/pi05_decoder_skinny_fp4_sm120.cu)
+  set_target_properties(pi05_decoder_skinny_fp4_sm120_obj PROPERTIES
+    CUDA_STANDARD 17
+    POSITION_INDEPENDENT_CODE ON
+  )
+  target_include_directories(pi05_decoder_skinny_fp4_sm120_obj PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/gemm/fp4
+  )
+  target_compile_options(pi05_decoder_skinny_fp4_sm120_obj PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:
+      --expt-relaxed-constexpr -O3
+      --ftz=true --prec-div=false --prec-sqrt=false
+      ${GPU_GENCODE}
+    >
+  )
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:pi05_decoder_skinny_fp4_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_PI05_DECODER_FP4_SM120=1)
+else()
+  message(STATUS "Pi0.5 NVFP4 prefix kernels: DISABLED")
+endif()
+if(FLASHRT_ENABLE_PI05_SDE)
+  message(STATUS "Pi0.5 SDE kernels: ENABLED (runtime opt-in)")
+  target_sources(flash_rt_kernels PRIVATE csrc/kernels/pi05/pi05_sde_step.cu)
+  target_compile_definitions(flash_rt_kernels PRIVATE ENABLE_PI05_SDE=1)
+  if(FLASHRT_ENABLE_PI05_SKINNY)
+    target_compile_definitions(pi05_decoder_skinny_sm120_obj PRIVATE ENABLE_PI05_SDE=1)
+  endif()
+else()
+  message(STATUS "Pi0.5 SDE kernels: DISABLED")
+endif()
+if(FLASHRT_ENABLE_PI05_SKINNY)
+  target_sources(flash_rt_kernels PRIVATE
+    $<TARGET_OBJECTS:pi05_decoder_skinny_sm120_obj>)
+  target_compile_definitions(flash_rt_kernels PRIVATE
+    FLASHRT_PI05_DECODER_SKINNY_SM120=1)
+endif()
+
 # Dedicated M=1 decode GEMV (FP8 + BF16); linked + macro defined wherever the
 # object is built (sm89 / sm110 / sm120) so the ENABLE_DECODE_GEMV_M1 bindings always
 # resolve, independent of FLASHRT_ENABLE_MOTUS.
@@ -1904,7 +2176,8 @@ if(GPU_ARCH STREQUAL "110" OR GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121"
     ENABLE_DECODE_GEMV_M1=1)
 endif()
 
-if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+if((GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
+   AND FLASHRT_ENABLE_QWEN3_FP8_PREFILL)
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:qwen3_prefill_sm120_obj>)
   target_compile_definitions(flash_rt_kernels PRIVATE
@@ -1917,9 +2190,11 @@ if(GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121")
   target_sources(flash_rt_kernels PRIVATE
     $<TARGET_OBJECTS:cutlass_nvfp4_w4a16_sm120_obj>
     $<TARGET_OBJECTS:sm120_nvfp4_ffn_obj>
+    $<TARGET_OBJECTS:nvfp4_skinny_sm120_obj>
     csrc/quantize/nvfp4_sf_reshape_sm120.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE
-    ENABLE_CUTLASS_SM120_NVFP4_W4A16=1)
+    ENABLE_CUTLASS_SM120_NVFP4_W4A16=1
+    FLASHRT_NVFP4_SKINNY_SM120=1)
   if(FLASHRT_ENABLE_SM120_DEV_KERNELS)
     target_sources(flash_rt_kernels PRIVATE
       $<TARGET_OBJECTS:sm120_nvfp4_dev_obj>)
@@ -2021,12 +2296,15 @@ endif()
 # The fused RoPE+QKNorm+KV-write megakernel is plain CUDA (no SM110-only
 # instructions) and removes ~11 launches per attention block; the FP8
 # Thor kernels stay SM110-only.
-if(FLASHRT_ENABLE_HYVLA AND GPU_ARCH STREQUAL "87")
+if(FLASHRT_ENABLE_HYVLA AND (GPU_ARCH STREQUAL "87" OR
+                             GPU_ARCH STREQUAL "120" OR GPU_ARCH STREQUAL "121"))
   target_sources(flash_rt_kernels PRIVATE
     csrc/kernels/hyvla_fused_thor.cu
-    csrc/kernels/hyvla_vit_fuse.cu)
+    csrc/kernels/hyvla_vit_fuse.cu
+    csrc/kernels/hyvla_prefill_attn.cu
+    csrc/kernels/hyvla_euler.cu)
   target_compile_definitions(flash_rt_kernels PRIVATE FLASHRT_HAVE_HYVLA_ORIN=1)
-  message(STATUS "Hy-VLA Orin SM87 fused attention-prep kernel: ENABLED")
+  message(STATUS "Hy-VLA SM87/SM120/SM121 fused attention-prep kernel: ENABLED")
 endif()
 
 target_link_libraries(flash_rt_kernels PRIVATE
@@ -2074,6 +2352,7 @@ if(ENABLE_SM100_CUTLASS)
     csrc/gemm/fp4/cutlass_fp4_gemm_bias_bf16_sm100.cu
     csrc/quantize/quantize_fp4_sfa_bf16.cu
     csrc/fused_fp4/dit_norm_fp4_sfa.cu
+    csrc/fused_fp4/silu_mul_fp4_sfa_bf16.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_geglu_il_sm100.cu
     csrc/quantize/quantize_e0m3_sfa.cu
     csrc/gemm/fp4/cutlass_fp4_gemm_e0m3w_sm100.cu
@@ -2085,6 +2364,12 @@ if(ENABLE_SM100_CUTLASS)
       csrc/fused_fp4/cosmos3_edge_fp4.cu
       csrc/gemm/fp4/cosmos3_edge_fp4_gemm_relu2_fp4out.cu)
     target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
+  if(FLASHRT_ENABLE_ALPAMAYO15)
+    target_sources(fp4_kernels_obj PRIVATE
+      csrc/gemm/fp4/alpamayo15_nvfp4_gemm_sm100.cu
+      csrc/quantize/alpamayo15_nvfp4_rows.cu)
+    target_compile_definitions(fp4_kernels_obj PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
   endif()
   set_target_properties(fp4_kernels_obj PROPERTIES
     CUDA_STANDARD 17
@@ -2119,6 +2404,9 @@ if(ENABLE_SM100_CUTLASS)
   )
   if(FLASHRT_ENABLE_COSMOS3_EDGE)
     target_compile_definitions(flash_rt_fp4 PRIVATE FLASHRT_HAVE_COSMOS3_EDGE=1)
+  endif()
+  if(FLASHRT_ENABLE_ALPAMAYO15)
+    target_compile_definitions(flash_rt_fp4 PRIVATE FLASHRT_HAVE_ALPAMAYO15=1)
   endif()
   target_link_libraries(flash_rt_fp4 PRIVATE CUDA::cudart)
   install(TARGETS flash_rt_fp4 DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
@@ -2212,4 +2500,39 @@ if(JAX_FFI_DETECT_RESULT EQUAL 0
   install(TARGETS flash_rt_jax_ffi DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 else()
   message(STATUS "JAX FFI: SKIPPED (jax.ffi not importable or ffi.h missing)")
+endif()
+
+# Optional Pi0.5 Thor lowering. Shared kernels and other hardware stay unchanged.
+option(FLASHRT_ENABLE_PI05_THOR "Build optimized Pi0.5 SM110 kernels" OFF)
+if(FLASHRT_ENABLE_PI05_THOR)
+  if(NOT GPU_ARCH STREQUAL "110" OR NOT ENABLE_SM100_CUTLASS)
+    message(FATAL_ERROR "FLASHRT_ENABLE_PI05_THOR requires GPU_ARCH=110 and SM100 CUTLASS")
+  endif()
+  add_library(pi05_thor_obj OBJECT
+    csrc/kernels/pi05/thor/pi05_rowops.cu
+    csrc/kernels/pi05/thor/pi05_rowops_swizzled.cu
+    csrc/kernels/pi05/thor/pi05_l2_prefetch.cu
+    csrc/kernels/pi05/thor/pi05_quantize_fp8.cu
+    csrc/kernels/pi05/thor/pi05_gemm_fp8.cu
+    csrc/kernels/pi05/thor/pi05_rope.cu
+    csrc/kernels/pi05/thor/pi05_norm_fp4.cu
+    csrc/kernels/pi05/thor/pi05_pdl.cu
+    csrc/kernels/pi05/thor/pi05_action_edges.cu
+    csrc/kernels/pi05/thor/pi05_cutlass_fp4_gemm_variants.cu
+    csrc/kernels/pi05/thor/pi05_cutlass_fp4_gemm_variants_earlyb.cu
+    csrc/kernels/pi05/thor/pi05_cutlass_fp4_gemm_variants_swapenc.cu
+    csrc/kernels/pi05/thor/pi05_cutlass_fp4_gemm_geglu_il_sm100.cu
+    csrc/kernels/pi05/thor/pi05_cutlass_fp4_gemm_geglu_il_swap_sm100.cu
+    csrc/kernels/pi05/thor/pi05_cutlass_fp4_gemm_siglip_ffn_variants_sm100.cu
+    csrc/kernels/pi05/thor/pi05_patch_embed.cu
+)
+  set_target_properties(pi05_thor_obj PROPERTIES CUDA_STANDARD 17 POSITION_INDEPENDENT_CODE ON CUDA_VISIBILITY_PRESET hidden CXX_VISIBILITY_PRESET hidden)
+  target_include_directories(pi05_thor_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/csrc ${CUTLASS_INCLUDE} ${CUTLASS_DIR}/tools/util/include)
+  target_compile_options(pi05_thor_obj PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr -O3 --use_fast_math ${GPU_GENCODE}>)
+  target_compile_definitions(pi05_thor_obj PRIVATE CUTLASS_ARCH_MMA_SM100_SUPPORTED=1 CUTLASS_ENABLE_GDC_FOR_SM100=1)
+  pybind11_add_module(flash_rt_pi05_thor csrc/kernels/pi05/thor/pi05_bindings.cpp)
+  target_sources(flash_rt_pi05_thor PRIVATE $<TARGET_OBJECTS:pi05_thor_obj>)
+  target_include_directories(flash_rt_pi05_thor PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/csrc)
+  target_link_libraries(flash_rt_pi05_thor PRIVATE CUDA::cudart)
+  set_target_properties(flash_rt_pi05_thor PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/flash_rt)
 endif()
